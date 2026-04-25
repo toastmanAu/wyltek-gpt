@@ -1,0 +1,296 @@
+ollama:
+  url: http://localhost:11434
+  # If Ollama lives on another machine in your LAN/tailnet, override here.
+  # Example: http://192.168.1.100:11434
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+ui:
+  # The theme that loads on first visit. Built-in options:
+  #   catppuccin-mocha, tokyo-night, nord, classic-green, custom
+  # Drop a new file in frontend/themes/ to add more — the dropdown
+  # auto-discovers everything in that directory.
+  default_theme: tokyo-night
+
+assistant:
+  system_prompt: |
+    Always be truthful — if you don't know something, say so.
+    Calm and collected is always the best feel.
+    Nervos Network is the assumed blockchain base unless explicitly stated otherwise.
+    Most Nervos scripts are Rust; C is a secondary option.
+
+    Default to answering questions directly and conversationally in plain prose.
+    Do NOT generate code, scripts, or commands unless the user explicitly asks for one.
+    A question like "what OS are you on?" wants a short factual answer, not a script that detects the OS.
+
+    When the user does ask for code, use fenced blocks with a language tag.
+    When the user explicitly asks you to save something to a file, use this convention:
+
+    ```file:path/to/output.ext
+    <contents>
+    ```
+
+skills:
+  enabled: []  # filled in once the skill registry lands in v2
+
+# ──────────────────────────────────────────────────────────────────
+# Converter registry
+# ──────────────────────────────────────────────────────────────────
+# Each entry is a deterministic file conversion: source extension(s)
+# → target extension(s) via a specific binary on PATH.
+#
+# - The model never assembles commands. argv is fixed; runtime fills
+#   {input}, {output}, {out_dir}, {stem} from validated workspace paths.
+# - On startup, any entry whose `requires` binary is missing is
+#   soft-skipped with a one-line warning. The enabled list the UI/model
+#   sees is always the truth.
+# - Same-format conversions (e.g. png→png) are silently rejected —
+#   they'd overwrite the input. Use a "preset" id and a different
+#   target extension if you need same-format compression/optim later.
+# - Add new entries by appending to this list and reloading the server.
+#   Think of these as workflows, not raw tools — a preset that pins
+#   useful flags (e.g. ffmpeg with -crf 23 -preset fast) earns its
+#   place more than a generic catch-all.
+# ──────────────────────────────────────────────────────────────────
+converters:
+  # === Documents ===
+  - id: markitdown_to_md
+    from: [pdf, docx, xlsx, pptx, html, htm, csv, json, xml, zip, jpg, jpeg, png]
+    to: md
+    requires: markitdown
+    argv: [markitdown, "{input}", -o, "{output}"]
+
+  - id: libreoffice_to_pdf
+    from: [docx, doc, odt, rtf, xlsx, xls, ods, pptx, ppt, odp]
+    to: pdf
+    requires: libreoffice
+    argv: [libreoffice, --headless, --convert-to, pdf, --outdir, "{out_dir}", "{input}"]
+    timeout: 240
+
+  - id: pandoc_md_to_html
+    from: [md, markdown]
+    to: html
+    requires: pandoc
+    argv: [pandoc, "{input}", -o, "{output}"]
+
+  - id: pandoc_md_to_docx
+    from: [md, markdown]
+    to: docx
+    requires: pandoc
+    argv: [pandoc, "{input}", -o, "{output}"]
+
+  - id: pandoc_md_to_epub
+    from: [md, markdown]
+    to: epub
+    requires: pandoc
+    argv: [pandoc, "{input}", -o, "{output}"]
+
+  - id: pandoc_html_to_md
+    from: [html, htm]
+    to: md
+    requires: pandoc
+    argv: [pandoc, -f, html, -t, gfm, "{input}", -o, "{output}"]
+
+  - id: pandoc_docx_to_md
+    from: docx
+    to: md
+    requires: pandoc
+    argv: [pandoc, -f, docx, -t, gfm, "{input}", -o, "{output}"]
+
+  - id: weasyprint_html_to_pdf
+    from: [html, htm]
+    to: pdf
+    requires: weasyprint
+    argv: [weasyprint, "{input}", "{output}"]
+
+  - id: pdftotext
+    from: pdf
+    to: txt
+    requires: pdftotext
+    argv: [pdftotext, "{input}", "{output}"]
+
+  # === Ebooks ===
+  - id: calibre_ebook_convert
+    from: [epub, mobi, azw3, azw, fb2, lit, lrf, pdb, prc, htmlz]
+    to: [epub, mobi, azw3, pdf, txt, html, fb2]
+    requires: ebook-convert
+    argv: [ebook-convert, "{input}", "{output}"]
+    timeout: 240
+
+  # === Images ===
+  - id: vips_image_convert
+    from: [jpg, jpeg, png, webp, tiff, tif, gif, bmp, ppm]
+    to: [jpg, jpeg, png, webp, tiff, tif]
+    requires: vips
+    argv: [vips, copy, "{input}", "{output}"]
+
+  - id: cwebp_to_webp
+    from: [png, jpg, jpeg, tiff, tif]
+    to: webp
+    requires: cwebp
+    argv: [cwebp, -q, "{quality}", "{input}", -o, "{output}"]
+    params:
+      quality:
+        label: Quality
+        default: "80"
+        choices:
+          - {value: "95", label: "95 (high)"}
+          - {value: "80", label: "80 (balanced)"}
+          - {value: "60", label: "60 (small)"}
+
+  - id: dwebp_from_webp
+    from: webp
+    to: [png, pam, ppm]
+    requires: dwebp
+    argv: [dwebp, "{input}", -o, "{output}"]
+
+  - id: rsvg_svg_to_png
+    from: svg
+    to: png
+    requires: rsvg-convert
+    argv: [rsvg-convert, "{input}", -o, "{output}"]
+
+  - id: rsvg_svg_to_pdf
+    from: svg
+    to: pdf
+    requires: rsvg-convert
+    argv: [rsvg-convert, -f, pdf, "{input}", -o, "{output}"]
+
+  - id: gif_to_webp_animated
+    from: gif
+    to: webp
+    requires: gif2webp
+    argv: [gif2webp, "{input}", -o, "{output}"]
+
+  # === Video ===
+  # Per-target converters: each container has its preferred codec strategy.
+  # mp4 gets x264+aac with faststart (browser-streamable). webm gets vp9+opus
+  # with VBR. mkv stream-copies (no re-encode, instant). gif gets sane defaults.
+
+  - id: ffmpeg_to_mp4
+    from: [mp4, mkv, mov, webm, avi, m4v, flv]
+    to: mp4
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -c:v, libx264, -crf, "{quality}", -preset, fast,
+           -c:a, aac, -b:a, 128k, -movflags, +faststart, "{output}"]
+    timeout: 1800
+    params:
+      quality:
+        label: Quality
+        default: "23"
+        choices:
+          - {value: "18", label: "high (CRF 18)"}
+          - {value: "23", label: "balanced (CRF 23)"}
+          - {value: "28", label: "small (CRF 28)"}
+          - {value: "33", label: "tiny (CRF 33)"}
+
+  - id: ffmpeg_to_webm
+    from: [mp4, mkv, mov, webm, avi, m4v, flv]
+    to: webm
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -c:v, libvpx-vp9, -crf, "{quality}", -b:v, "0",
+           -c:a, libopus, -b:a, 128k, "{output}"]
+    timeout: 1800
+    params:
+      quality:
+        label: Quality
+        default: "32"
+        choices:
+          - {value: "24", label: "high (CRF 24)"}
+          - {value: "32", label: "balanced (CRF 32)"}
+          - {value: "38", label: "small (CRF 38)"}
+
+  - id: ffmpeg_to_mkv
+    from: [mp4, mkv, mov, webm, avi, m4v, flv]
+    to: mkv
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -c, copy, "{output}"]
+    timeout: 600
+
+  - id: ffmpeg_to_gif
+    from: [mp4, mkv, mov, webm, avi, m4v]
+    to: gif
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -vf, "fps={fps},scale={width}:-1:flags=lanczos", "{output}"]
+    timeout: 600
+    params:
+      fps:
+        label: FPS
+        default: "12"
+        choices:
+          - {value: "8", label: "8 fps (small)"}
+          - {value: "12", label: "12 fps"}
+          - {value: "15", label: "15 fps"}
+          - {value: "24", label: "24 fps (smooth)"}
+      width:
+        label: Width
+        default: "480"
+        choices:
+          - {value: "320", label: "320 px"}
+          - {value: "480", label: "480 px"}
+          - {value: "720", label: "720 px"}
+
+  # === Audio (lossy + lossless split — bitrate only applies to lossy) ===
+  - id: ffmpeg_video_to_audio
+    from: [mp4, mkv, mov, webm, avi, m4v, flv]
+    to: [mp3, m4a, ogg, opus]
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -vn, -b:a, "{bitrate}", "{output}"]
+    timeout: 600
+    params:
+      bitrate:
+        label: Bitrate
+        default: "128k"
+        choices:
+          - {value: "192k", label: "192 kbps (high)"}
+          - {value: "128k", label: "128 kbps"}
+          - {value: "96k", label: "96 kbps"}
+          - {value: "64k", label: "64 kbps (small)"}
+
+  - id: ffmpeg_video_to_audio_lossless
+    from: [mp4, mkv, mov, webm, avi, m4v, flv]
+    to: [wav, flac]
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -vn, "{output}"]
+    timeout: 600
+
+  - id: ffmpeg_audio_transcode
+    from: [mp3, wav, flac, m4a, ogg, opus, aac]
+    to: [mp3, m4a, ogg, opus]
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", -b:a, "{bitrate}", "{output}"]
+    timeout: 600
+    params:
+      bitrate:
+        label: Bitrate
+        default: "128k"
+        choices:
+          - {value: "192k", label: "192 kbps (high)"}
+          - {value: "128k", label: "128 kbps"}
+          - {value: "96k", label: "96 kbps"}
+          - {value: "64k", label: "64 kbps (small)"}
+
+  - id: ffmpeg_audio_to_lossless
+    from: [mp3, wav, flac, m4a, ogg, opus, aac]
+    to: [wav, flac]
+    requires: ffmpeg
+    argv: [ffmpeg, -y, -i, "{input}", "{output}"]
+    timeout: 600
+
+  - id: whisper_transcribe
+    from: [mp3, wav, m4a, flac, ogg, mp4, mkv, webm]
+    to: txt
+    requires: whisper
+    argv: [whisper, "{input}", --model, "{model}", --output_dir, "{out_dir}", --output_format, txt]
+    timeout: 1800
+    params:
+      model:
+        label: Model
+        default: base
+        choices:
+          - {value: tiny, label: "tiny (fastest)"}
+          - {value: base, label: "base (balanced)"}
+          - {value: small, label: "small"}
+          - {value: medium, label: "medium (most accurate)"}

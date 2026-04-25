@@ -1,0 +1,22 @@
+/* ──────────────────────────────────────────────────────────────────
+   TODO(phill): your theme. Pick a palette you like and fill these in.
+   This file ships as a copy of tokyo-night with one obviously wrong
+   accent — that's deliberate, so you'll spot it the first time you
+   pick "custom" from the dropdown and know exactly which token to
+   change. To add another theme later, drop a new .css file in this
+   folder and the dropdown will pick it up on next reload.
+   ────────────────────────────────────────────────────────────────── */
+[data-theme="custom"] {
+  --bg-0: #0b0f14;
+  --bg-1: #11161d;
+  --fg-0: #d6e2ff;
+  --fg-1: #6b7a99;
+  --accent: #ff8c00;          /* <- change me */
+  --accent-contrast: #0b0f14;
+  --border: #1f2733;
+  --role-user: #ffd166;
+  --role-assistant: #ff8c00;
+  --error: #ef476f;
+  --code-bg: #11161d;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}

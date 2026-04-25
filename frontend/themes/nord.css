@@ -1,0 +1,14 @@
+[data-theme="nord"] {
+  --bg-0: #2e3440;
+  --bg-1: #3b4252;
+  --fg-0: #eceff4;
+  --fg-1: #81a1c1;
+  --accent: #88c0d0;
+  --accent-contrast: #2e3440;
+  --border: #4c566a;
+  --role-user: #a3be8c;
+  --role-assistant: #88c0d0;
+  --error: #bf616a;
+  --code-bg: #3b4252;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}

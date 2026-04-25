@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# App data — workspaces are user files, never publish
+workspaces/
+data/*.sqlite
+
+# Claude Code session state
+.claude/
+.remember/
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Logo source candidates — only image10.png ships, derived icons live in frontend/icons/
+images/
+
+# Test scratch
+/tmp/

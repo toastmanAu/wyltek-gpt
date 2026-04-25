@@ -1,0 +1,14 @@
+[data-theme="tokyo-night"] {
+  --bg-0: #1a1b26;
+  --bg-1: #16161e;
+  --fg-0: #c0caf5;
+  --fg-1: #565f89;
+  --accent: #7aa2f7;
+  --accent-contrast: #1a1b26;
+  --border: #2a2e3f;
+  --role-user: #9ece6a;
+  --role-assistant: #7aa2f7;
+  --error: #f7768e;
+  --code-bg: #16161e;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}

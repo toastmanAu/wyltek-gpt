@@ -1,0 +1,14 @@
+[data-theme="catppuccin-mocha"] {
+  --bg-0: #1e1e2e;
+  --bg-1: #181825;
+  --fg-0: #cdd6f4;
+  --fg-1: #6c7086;
+  --accent: #cba6f7;
+  --accent-contrast: #1e1e2e;
+  --border: #313244;
+  --role-user: #a6e3a1;
+  --role-assistant: #cba6f7;
+  --error: #f38ba8;
+  --code-bg: #11111b;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}

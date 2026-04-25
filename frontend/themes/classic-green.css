@@ -1,0 +1,14 @@
+[data-theme="classic-green"] {
+  --bg-0: #000000;
+  --bg-1: #0a0a0a;
+  --fg-0: #33ff66;
+  --fg-1: #1f8a3f;
+  --accent: #33ff66;
+  --accent-contrast: #000000;
+  --border: #1f8a3f;
+  --role-user: #ccffcc;
+  --role-assistant: #33ff66;
+  --error: #ff5555;
+  --code-bg: #0a0a0a;
+  --font-mono: "VT323", "JetBrains Mono", ui-monospace, monospace;
+}

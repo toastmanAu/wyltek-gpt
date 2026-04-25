@@ -1,0 +1,587 @@
+I want to build a local inference powered, browser based chat terminal that I can access from my local network/tailscale. Predominantly mobile focused, hosted on a Linux desktop powered with ollama and various models. I want a chat input box and a terminal output gpt style. I want a drop down box that lets me choose local ollama models to respond. I want the chatbot to be able to accept file input to feed inference as well as the ability for it to output files. The chatbot should have the ability to have skills/plugins utilised.
+
+Yes. I’d build this as a local “ChatGPT-style terminal” web app with Ollama as the model backend, a small server layer for files/tools/security, and a mobile-first browser UI.
+The important design choice: do not let the browser talk directly to Ollama. Put your own backend in the middle. That backend handles model discovery, chat streaming, file ingestion, plugin execution, saved conversations, and file output.
+Recommended v1 architecture
+Phone / tablet browser
+        |
+        |  HTTPS over LAN or Tailscale
+        v
+Mobile web UI
+React / Svelte / plain HTML
+        |
+        |  WebSocket or Server-Sent Events
+        v
+Local chat server
+Node.js / Python FastAPI / Rust Axum
+        |
+        +--> Ollama API
+        |
+        +--> File store
+        |
+        +--> Conversation DB
+        |
+        +--> Skills / plugins runner
+        |
+        +--> Output files directory
+Ollama exposes a local API on port 11434, including /api/chat for chat-style messages and /api/tags for listing local models. The chat endpoint supports streaming responses, which is exactly what you want for a GPT-style terminal output.  
+For Tailscale access, use Tailscale Serve, not Funnel, unless you intentionally want public internet access. Tailscale Serve exposes a local service only inside your tailnet, while Funnel is for sharing to the public internet.  
+
+Core feature set
+1. Mobile-first browser chat terminal
+The UI should be simple:
+------------------------------------------------
+Model: [ qwen2.5-coder:14b v ]  Skill mode: [Auto]
+------------------------------------------------
+assistant>
+Streaming response appears here...
+
+user>
+[ input box                                      ]
+[ attach file ] [ send ] [ stop ]
+------------------------------------------------
+Files:
+- output/report.md
+- output/script.py
+------------------------------------------------
+For mobile, make it feel more like a terminal than a heavy desktop app:
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #0b0f14;
+  color: #d6e2ff;
+}
+
+.chat-shell {
+  max-width: 900px;
+  margin: auto;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  white-space: pre-wrap;
+}
+
+.input-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-top: 1px solid #222;
+}
+
+textarea {
+  flex: 1;
+  min-height: 48px;
+  max-height: 160px;
+}
+Use Server-Sent Events or WebSockets for streaming. SSE is easier for v1. WebSockets are better once you add stop/cancel, token telemetry, plugin events, and multi-agent workflows.
+
+Backend choice
+Given your ecosystem, I’d pick one of these:
+Option A: FastAPI backend
+Best for quick AI tooling, file parsing, Python plugins, embeddings, and RAG.
+frontend: SvelteKit / React / vanilla
+backend: Python FastAPI
+db: SQLite
+files: local ./workspace
+ollama: HTTP API
+plugins: Python functions or subprocess skills
+This is probably the fastest path.
+Option B: Node.js backend
+Best if you want a web-native stack, streaming APIs, and easy frontend/backend integration.
+frontend: SvelteKit / Next.js / React
+backend: Node.js / Express / Hono
+db: SQLite
+files: local ./workspace
+ollama: HTTP API
+plugins: JS/TS modules + subprocess bridge
+Option C: Rust backend
+Best if this eventually becomes a serious local agent terminal / secure systems controller.
+frontend: Svelte / React
+backend: Rust Axum
+db: SQLite
+files: local ./workspace
+ollama: HTTP API
+plugins: command registry
+For your first version, I’d do FastAPI + simple HTML/Svelte frontend + SQLite. Then later you can port the backend to Rust if it becomes core infrastructure.
+
+Ollama integration
+The backend needs a route like:
+GET /api/models
+which calls:
+GET http://localhost:11434/api/tags
+Then the dropdown is populated from installed Ollama models.
+Example model response flow:
+async function loadModels() {
+  const res = await fetch("/api/models");
+  const models = await res.json();
+
+  const select = document.querySelector("#model-select");
+  select.innerHTML = "";
+
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.name;
+    option.textContent = model.name;
+    select.appendChild(option);
+  }
+}
+For chat, your backend sends:
+{
+  "model": "qwen2.5-coder:14b",
+  "messages": [
+    { "role": "system", "content": "You are a local terminal assistant." },
+    { "role": "user", "content": "Write a script to monitor my CKB node." }
+  ],
+  "stream": true
+}
+to:
+POST http://localhost:11434/api/chat
+Ollama’s /api/chat endpoint takes a model and message list, and its default behavior is streaming, which suits your terminal-style output.  
+
+File input design
+You want file input “to feed inference.” I would split that into three modes, because they are not the same problem.
+1. Inline file context
+Good for small files.
+User uploads:
+notes.md
+config.json
+error.log
+small source file
+Backend reads text and injects it into the prompt:
+The user uploaded file notes.md:
+
+--- file: notes.md ---
+...
+--- end file ---
+This is easy and works immediately.
+2. Workspace file access
+Good for coding-agent behavior.
+User uploads files into a local workspace:
+/workspaces/session-123/
+  main.cpp
+  README.md
+  logs/
+  output/
+The model does not receive the whole file automatically. Instead, your plugin system gives it tools:
+read_file(path)
+write_file(path, content)
+list_files(path)
+search_files(query)
+This is the path toward a Claude Code / local agent style interface.
+3. RAG ingestion
+Good for large documents.
+Uploaded files are chunked, embedded, indexed, and retrieved as needed.
+PDF / markdown / codebase
+        |
+text extraction
+        |
+chunking
+        |
+embeddings
+        |
+SQLite/Chroma/Qdrant/LanceDB
+        |
+retrieval into prompt
+For v1, skip complex RAG unless you already have your local RAG pipeline ready. Start with inline context and workspace tools.
+
+File output design
+This is easier than file input.
+Let the assistant return structured blocks like:
+```file:output/node-bandwidth-monitor.sh
+#!/usr/bin/env bash
+echo "hello"
+```
+Your backend detects file: code blocks and writes them to disk:
+/workspaces/session-123/output/node-bandwidth-monitor.sh
+Then the UI shows:
+Generated files:
+[Download node-bandwidth-monitor.sh]
+Later you can add a proper tool call:
+{
+  "tool": "write_file",
+  "args": {
+    "path": "output/report.md",
+    "content": "..."
+  }
+}
+That is cleaner and safer.
+
+Skills / plugins architecture
+This is the part I’d design carefully from day one.
+Do not start by giving the model arbitrary shell access. Create a plugin registry.
+Example:
+skills:
+  - name: read_file
+    description: Read a file from the current workspace.
+    input_schema:
+      path: string
+    permissions:
+      filesystem: read
+      shell: false
+
+  - name: write_file
+    description: Write a file to the current workspace.
+    input_schema:
+      path: string
+      content: string
+    permissions:
+      filesystem: write
+      shell: false
+
+  - name: run_command
+    description: Run an approved shell command.
+    input_schema:
+      command: string
+    permissions:
+      shell: restricted
+
+  - name: ckb_node_status
+    description: Check local CKB node status.
+    input_schema: {}
+    permissions:
+      network: localhost
+Then your backend exposes tools to the model in a controlled way.
+Skill execution loop
+Basic flow:
+1. User sends message.
+2. Backend sends prompt + available tools to Ollama.
+3. Model responds normally, or emits a tool request.
+4. Backend validates the tool request.
+5. Backend executes the tool.
+6. Backend sends tool result back to model.
+7. Model gives final answer.
+For local Ollama models that do not reliably support native tool-calling, use a plain JSON convention:
+When you need to use a tool, respond only with JSON:
+
+{
+  "tool": "read_file",
+  "args": {
+    "path": "README.md"
+  }
+}
+Your backend parses that. If valid, it runs the tool and continues.
+This is simple, robust, and model-agnostic.
+
+Suggested v1 folder structure
+local-chat-terminal/
+├── backend/
+│   ├── app.py
+│   ├── ollama_client.py
+│   ├── chat.py
+│   ├── files.py
+│   ├── skills/
+│   │   ├── registry.py
+│   │   ├── read_file.py
+│   │   ├── write_file.py
+│   │   ├── list_files.py
+│   │   ├── run_command.py
+│   │   └── ckb_node_status.py
+│   ├── db.py
+│   └── workspaces/
+│       └── session-id/
+├── frontend/
+│   ├── index.html
+│   ├── app.js
+│   └── style.css
+├── data/
+│   └── chat.sqlite
+├── config.yaml
+├── docker-compose.yml
+└── README.md
+
+Minimal FastAPI backend shape
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
+import httpx
+import json
+import os
+from pathlib import Path
+
+app = FastAPI()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+WORKSPACE_ROOT = Path("./workspaces")
+WORKSPACE_ROOT.mkdir(exist_ok=True)
+
+
+@app.get("/api/models")
+async def models():
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{OLLAMA_URL}/api/tags")
+        r.raise_for_status()
+        data = r.json()
+        return data.get("models", [])
+
+
+@app.post("/api/upload")
+async def upload_file(session_id: str, file: UploadFile = File(...)):
+    session_dir = WORKSPACE_ROOT / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(file.filename).name
+    target = session_dir / safe_name
+
+    content = await file.read()
+    target.write_bytes(content)
+
+    return {
+        "filename": safe_name,
+        "path": str(target),
+        "size": len(content)
+    }
+
+
+@app.post("/api/chat")
+async def chat(payload: dict):
+    model = payload["model"]
+    messages = payload["messages"]
+
+    async def stream():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": True
+                },
+            ) as response:
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+
+                    data = json.loads(line)
+
+                    if "message" in data:
+                        content = data["message"].get("content", "")
+                        if content:
+                            yield content
+
+                    if data.get("done"):
+                        break
+
+    return StreamingResponse(stream(), media_type="text/plain")
+That gives you:
+/api/models
+/api/upload
+/api/chat
+Enough for a working v1.
+
+Frontend shape
+<select id="model"></select>
+
+<div id="messages"></div>
+
+<input id="file" type="file" />
+<textarea id="input" placeholder="Ask local inference..."></textarea>
+<button id="send">Send</button>
+
+<script src="/app.js"></script>
+const modelSelect = document.getElementById("model");
+const messages = document.getElementById("messages");
+const input = document.getElementById("input");
+
+let history = [
+  {
+    role: "system",
+    content: "You are a local inference powered terminal assistant."
+  }
+];
+
+async function loadModels() {
+  const res = await fetch("/api/models");
+  const models = await res.json();
+
+  for (const m of models) {
+    const option = document.createElement("option");
+    option.value = m.name;
+    option.textContent = m.name;
+    modelSelect.appendChild(option);
+  }
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = "";
+
+  history.push({ role: "user", content: text });
+  append("user", text);
+
+  const assistantEl = append("assistant", "");
+
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: modelSelect.value,
+      messages: history
+    })
+  });
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+
+  let assistantText = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value);
+    assistantText += chunk;
+    assistantEl.textContent = assistantText;
+  }
+
+  history.push({ role: "assistant", content: assistantText });
+}
+
+function append(role, text) {
+  const el = document.createElement("div");
+  el.className = `message ${role}`;
+  el.textContent = `${role}> ${text}`;
+  messages.appendChild(el);
+  messages.scrollTop = messages.scrollHeight;
+  return el;
+}
+
+document.getElementById("send").onclick = sendMessage;
+
+loadModels();
+That is crude, but it proves the loop.
+
+Security model
+Because this will be reachable over LAN/Tailscale and eventually able to run skills, you need guardrails early.
+Minimum security
+Use:
+- login/password or token auth
+- bind backend only to localhost or Tailscale interface
+- never expose raw Ollama port publicly
+- workspace sandboxing
+- max upload size
+- allowed file extensions
+- path traversal protection
+- command allowlist
+- per-skill permissions
+Do not allow the model to run:
+rm -rf
+curl | bash
+sudo
+chmod -R
+ssh
+scp
+dd
+mkfs
+mount
+unless you explicitly approve that skill.
+For Tailscale, expose your app with Serve:
+tailscale serve --bg 3000
+Tailscale’s docs describe Serve as routing traffic from other devices in your tailnet to a local service, which matches your use case.  
+
+Best v1 feature order
+Build it in this order:
+1. Basic mobile chat UI
+2. Ollama model dropdown from /api/tags
+3. Streaming chat via /api/chat
+4. Persistent chat history in SQLite
+5. File upload into per-session workspace
+6. Inject small uploaded files into prompt
+7. Generated file detection and download links
+8. Skill registry
+9. read_file / write_file / list_files tools
+10. restricted shell command tool
+11. RAG ingestion for large files
+12. auth + Tailscale Serve hardening
+That gets you useful quickly without overengineering.
+
+Plugin/skill ideas for your setup
+Given your actual workflow, I’d create these early:
+filesystem.read
+filesystem.write
+filesystem.search
+shell.run_restricted
+ollama.list_models
+ollama.pull_model
+ckb.node_status
+ckb.rpc_call
+ckb.indexer_status
+ckb.bandwidth_report
+git.status
+git.diff
+git.commit_summary
+rag.search_local
+worker.deploy_cloudflare
+esp32.build
+esp32.flash
+arduino.compile
+For your Nervos/embedded stack, a local terminal like this becomes extremely useful if it can do:
+“Check my CKB node status and summarize sync health.”
+“Read this Arduino compile error and patch the sketch.”
+“Generate a Cloudflare Worker and save it to output/worker.js.”
+“Search my local CKB RAG for DAO deposit details.”
+“Run the bandwidth monitor and give me a short report.”
+
+Should you use Open WebUI instead?
+You could. Open WebUI already gives you a local browser UI for Ollama-style usage. But for your goal, I think a custom build makes sense because you want:
+- mobile terminal UX
+- custom skills
+- file output generation
+- local workspace behavior
+- CKB/node/embedded-specific tools
+- future agent orchestration
+- Tailscale-first private access
+Open WebUI is good as a reference, but your idea sounds more like a local agent terminal than a generic chatbot.
+
+My recommended stack
+For your first serious build:
+Frontend:
+  SvelteKit or plain Vite + TypeScript
+
+Backend:
+  FastAPI
+
+Model runtime:
+  Ollama
+
+Transport:
+  SSE for v1 streaming
+  WebSockets later
+
+Database:
+  SQLite
+
+Files:
+  ./workspaces/{session_id}/
+
+Plugins:
+  Python skill registry first
+  subprocess bridge for shell/Rust/Node tools
+
+Access:
+  Tailscale Serve
+
+Auth:
+  simple password/token first
+The end result is basically:
+Hermes-lite local browser terminal
+        +
+Ollama model router
+        +
+mobile-friendly GPT terminal
+        +
+file workspace
+        +
+plugin/skill executor
+        +
+LAN/Tailscale private access
+That is absolutely worth building. It fits perfectly with your local inference + RAG + node maintenance + embedded coding direction.
