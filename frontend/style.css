@@ -210,6 +210,21 @@ body {
 .msg.error .role,
 .msg.error .content { color: var(--error); }
 
+.stats-bar {
+  font-style: italic;
+  font-size: 0.78em;
+  color: var(--stats, #e0af68);
+  padding: 0.25rem 0.75rem;
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  opacity: 0.9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stats-bar.idle { opacity: 0.5; }
+.stats-bar.busy { color: var(--accent); }
+
 .composer {
   display: flex;
   gap: 0.5rem;

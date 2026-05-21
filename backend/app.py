@@ -264,14 +264,40 @@ async def list_models():
 async def chat(payload: dict):
     """Streaming chat. Forwards Ollama tool definitions when available so
     capable models can emit native tool_calls; less-capable models emit
-    structured ``op:<name> {...}`` blocks parsed client-side instead."""
+    structured ``op:<name> {...}`` blocks parsed client-side instead.
+
+    If ``image_files`` is supplied (list of workspace filenames), the bytes
+    are base64-encoded and attached to the last user message's ``images``
+    field — Ollama's multimodal-vision contract. The frontend is expected
+    to only send images when the active model has the vision capability."""
     model = payload.get("model")
     incoming = payload.get("messages", [])
+    image_files = payload.get("image_files") or []
+    session_id = payload.get("session_id", "default")
     if not model or not incoming:
         raise HTTPException(400, "Missing 'model' or 'messages'")
 
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
+
+    if image_files:
+        images_b64: list[str] = []
+        for name in image_files:
+            try:
+                _, path = _resolve_in_workspace(session_id, name)
+            except (ValueError, HTTPException) as exc:
+                log.warning("chat: cannot resolve image %r: %s", name, exc)
+                continue
+            if not path.exists() or path.suffix.lower() not in _IMAGE_EXTS:
+                log.warning("chat: skipping non-image or missing file %r", name)
+                continue
+            images_b64.append(base64.b64encode(path.read_bytes()).decode("ascii"))
+        if images_b64:
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    m["images"] = images_b64
+                    log.info("chat: attached %d image(s) to %s", len(images_b64), model)
+                    break
 
     body_with_tools: dict = {"model": model, "messages": messages, "stream": True}
     if OPERATIONS.enabled:
@@ -282,6 +308,7 @@ async def chat(payload: dict):
         """Stream one POST to Ollama. Yields:
             ('chunk', str)           — model text chunks
             ('tool_calls', list)     — final tool_calls payload, if any
+            ('stats', dict)          — timing/token counters from Ollama's done frame
             ('error', dict)          — Ollama returned non-2xx; dict has 'status' + 'error'
             ('done', None)           — stream completed normally
         """
@@ -310,6 +337,18 @@ async def chat(payload: dict):
                     if tool_calls:
                         yield "tool_calls", tool_calls
                     if data.get("done"):
+                        # Surface Ollama's perf counters to the UI stats bar.
+                        # All durations are nanoseconds; the frontend converts.
+                        stats = {
+                            "model": data.get("model") or body.get("model"),
+                            "load_ns": data.get("load_duration", 0),
+                            "prompt_eval_count": data.get("prompt_eval_count", 0),
+                            "prompt_eval_ns": data.get("prompt_eval_duration", 0),
+                            "eval_count": data.get("eval_count", 0),
+                            "eval_ns": data.get("eval_duration", 0),
+                            "total_ns": data.get("total_duration", 0),
+                        }
+                        yield "stats", stats
                         yield "done", None
                         return
                 yield "done", None
@@ -324,6 +363,8 @@ async def chat(payload: dict):
                 yield value
             elif kind == "tool_calls":
                 yield "\n" + json.dumps({"__tool_calls__": value})
+            elif kind == "stats":
+                yield "\n" + json.dumps({"__stats__": value})
             elif kind == "error":
                 err_msg = str(value.get("error", "")).lower()
                 if (not attempted_fallback
@@ -336,6 +377,8 @@ async def chat(payload: dict):
                             yield v2
                         elif k2 == "tool_calls":
                             yield "\n" + json.dumps({"__tool_calls__": v2})
+                        elif k2 == "stats":
+                            yield "\n" + json.dumps({"__stats__": v2})
                         elif k2 == "error":
                             yield f"\n[backend error: Ollama {v2['status']}: {v2['error']}]"
                             return

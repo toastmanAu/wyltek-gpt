@@ -11,6 +11,7 @@ const trayClear = $("#tray-clear");
 const input = $("#input");
 const composer = $("#composer");
 const sendBtn = $("#send");
+const statsBar = $("#stats-bar");
 
 const STORAGE = {
   theme: "lcb.theme",
@@ -667,6 +668,54 @@ function parseToolCallSentinel(text) {
   }
 }
 
+// Mirror parseToolCallSentinel for `{"__stats__": {...}}` lines emitted at
+// stream end. Returns the parsed stats object (or null) plus the text with
+// the sentinel removed.
+function parseStatsSentinel(text) {
+  const idx = text.lastIndexOf('{"__stats__"');
+  if (idx < 0) return { stats: null, cleanedText: text };
+  const tail = text.slice(idx);
+  const newline = tail.indexOf("\n");
+  const jsonLine = newline === -1 ? tail : tail.slice(0, newline);
+  try {
+    const parsed = JSON.parse(jsonLine);
+    return { stats: parsed.__stats__ || null, cleanedText: text.slice(0, idx).trimEnd() };
+  } catch {
+    return { stats: null, cleanedText: text };
+  }
+}
+
+function setStatsBusy(label) {
+  if (!statsBar) return;
+  statsBar.classList.remove("idle");
+  statsBar.classList.add("busy");
+  statsBar.textContent = label || "generating...";
+}
+
+function updateStatsBar(stats) {
+  if (!statsBar || !stats) return;
+  const parts = [];
+  const loadS = (stats.load_ns || 0) / 1e9;
+  const evalS = (stats.eval_ns || 0) / 1e9;
+  const promptS = (stats.prompt_eval_ns || 0) / 1e9;
+  const tokOut = stats.eval_count || 0;
+  const tokIn = stats.prompt_eval_count || 0;
+  const tps = evalS > 0 ? tokOut / evalS : 0;
+
+  // Surface load time only when meaningful (Ollama returns 0 for warm
+  // requests). Eviction-and-reload events show up as a spike here — the
+  // whole point of the bar is making those visible.
+  if (loadS >= 0.05) parts.push(`load ${loadS.toFixed(1)}s`);
+  if (promptS >= 0.05) parts.push(`prompt ${tokIn}t/${promptS.toFixed(1)}s`);
+  if (evalS > 0) parts.push(`gen ${evalS.toFixed(1)}s`);
+  if (tps > 0) parts.push(`${tps.toFixed(1)} tok/s`);
+  if (tokOut) parts.push(`${tokOut} out`);
+  if (stats.model) parts.push(stats.model);
+
+  statsBar.classList.remove("busy", "idle");
+  statsBar.textContent = parts.join(" · ") || "done";
+}
+
 async function maybeEnhancePrompt(op, params) {
   if (!op.enhance) return null;
   const userPrompt = String(params.prompt || "").trim();
@@ -1016,12 +1065,28 @@ async function send() {
   streaming = true;
   sendBtn.disabled = true;
 
+  // Sticky image attachment: if a pending image is in the tray and the
+  // active model has vision, ride it along on every turn. Ollama accepts
+  // base64 image bytes per-message; the backend re-reads from the
+  // workspace and attaches to the last user message.
+  const attachImage = !!(
+    pending &&
+    isImageFile(pending.name) &&
+    capabilities[modelSel.value]?.vision
+  );
+  const chatBody = { model: modelSel.value, messages: history };
+  if (attachImage) {
+    chatBody.image_files = [pending.name];
+    chatBody.session_id = SESSION;
+  }
+
+  setStatsBusy(`${modelSel.value} · generating...`);
   let acc = "";
   try {
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: modelSel.value, messages: history }),
+      body: JSON.stringify(chatBody),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const reader = r.body.getReader();
@@ -1035,9 +1100,12 @@ async function send() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    // Strip the native-tool-call sentinel out of the displayed text and
-    // collect both kinds of operation invocations.
-    const { calls: toolCalls, cleanedText } = parseToolCallSentinel(acc);
+    // Strip both sentinels (tool_calls + stats) out of displayed text and
+    // surface what each carries to the right place — tool calls render as
+    // confirm cards below, stats update the perf bar above the composer.
+    const { stats, cleanedText: noStats } = parseStatsSentinel(acc);
+    if (stats) updateStatsBar(stats);
+    const { calls: toolCalls, cleanedText } = parseToolCallSentinel(noStats);
     // Strip op fences from displayed text too — they're already shown as
     // confirm cards below, so leaving them as raw JSON in the assistant
     // line is just noise.
@@ -1067,6 +1135,11 @@ async function send() {
     stopThinking();
     out.textContent = ` [error: ${e.message}]`;
     out.parentElement.classList.add("error");
+    if (statsBar) {
+      statsBar.classList.remove("busy");
+      statsBar.classList.add("idle");
+      statsBar.textContent = `error: ${e.message}`;
+    }
   } finally {
     stopThinking();  // idempotent — covers stream-completed-with-no-chunks edge
     out.classList.remove("streaming");
