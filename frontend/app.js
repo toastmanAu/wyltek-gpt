@@ -685,6 +685,200 @@ function parseStatsSentinel(text) {
   }
 }
 
+// ─── code-block downloads ──────────────────────────────────────────
+// When the model emits fenced code blocks with a language tag (e.g.
+// ```html), surface a download button next to the assistant bubble so
+// the user can save it as a file on their device. Frontend-only via Blob
+// URLs — no backend round-trip, works the same on phone and desktop.
+
+// Map fence language to file extension. Unknown langs fall back to the
+// lang string itself as the extension (lowercased) so e.g. ```rs gives
+// snippet-N.rs and ```julia gives snippet-N.julia.
+const LANG_TO_EXT = {
+  html: "html", htm: "html", xhtml: "html",
+  md: "md", markdown: "md",
+  json: "json", jsonc: "json", json5: "json",
+  js: "js", javascript: "js", mjs: "mjs", cjs: "cjs",
+  ts: "ts", typescript: "ts",
+  jsx: "jsx", tsx: "tsx",
+  py: "py", python: "py",
+  c: "c", h: "h",
+  cpp: "cpp", "c++": "cpp", cxx: "cpp", cc: "cpp", hpp: "hpp", hxx: "hpp",
+  rs: "rs", rust: "rs",
+  go: "go", golang: "go",
+  java: "java", kt: "kt", kotlin: "kt", swift: "swift",
+  rb: "rb", ruby: "rb", php: "php",
+  yaml: "yaml", yml: "yaml", toml: "toml", ini: "ini",
+  xml: "xml", svg: "svg",
+  css: "css", scss: "scss", sass: "sass", less: "less",
+  sh: "sh", bash: "sh", zsh: "sh", shell: "sh", ps1: "ps1", powershell: "ps1",
+  sql: "sql", graphql: "graphql", gql: "graphql",
+  diff: "diff", patch: "patch",
+  csv: "csv", tsv: "tsv",
+  text: "txt", txt: "txt", plain: "txt",
+  vue: "vue", svelte: "svelte",
+};
+// Some langs map to a filename, not an extension — set the filename
+// directly rather than appending `.<lang>` to "snippet-N".
+const LANG_TO_FILENAME = {
+  dockerfile: "Dockerfile",
+  makefile: "Makefile",
+  cmake: "CMakeLists.txt",
+};
+
+// Captures ```<info>?\n...body...\n``` blocks. The info string is anything
+// up to the newline — CommonMark allows arbitrary text there ("python",
+// "file:foo.py", "python title='example'"). We parse it in parseFenceInfo
+// to extract language and/or filename. Models trained on GitHub READMEs
+// commonly emit ```file:<name> as an explicit filename signal — that's
+// the case we most want to honour. Op fences are stripped upstream so we
+// won't double-up here.
+const CODE_FENCE_FOR_DOWNLOAD_RE = /```([^\n]*)\n([\s\S]*?)```/g;
+
+// Pull a {lang, filename} hint out of a fence info string. Patterns seen
+// in the wild:
+//   ```python                        → lang=python
+//   ```file:snake.html               → filename=snake.html
+//   ```snake.html                    → filename=snake.html (looks like a path)
+//   ```python title="example.py"     → lang=python, filename=example.py
+//   ```html name=index.html          → lang=html, filename=index.html
+//   ```python:example.py             → lang=python, filename=example.py
+function parseFenceInfo(info) {
+  const raw = (info || "").trim();
+  if (!raw) return { lang: "", filename: "" };
+  // Quoted name=... / title=... / filename=... attribute pattern.
+  const attr = raw.match(/(?:file(?:name)?|name|title)\s*=\s*["']?([^"'\s]+\.[a-zA-Z0-9]+)["']?/i);
+  if (attr) {
+    const firstToken = raw.split(/[\s:=]+/)[0].toLowerCase();
+    const lang = /^[a-zA-Z0-9_+\-]+$/.test(firstToken) ? firstToken : "";
+    return { lang, filename: attr[1] };
+  }
+  // Explicit `file:foo.ext` or `filename:foo.ext` prefix.
+  const filePrefix = raw.match(/^(?:file(?:name)?)\s*:\s*([^\s]+)/i);
+  if (filePrefix) return { lang: "", filename: filePrefix[1] };
+  // `lang:filename.ext` compound (uncommon but seen).
+  const langColon = raw.match(/^([a-zA-Z0-9_+\-]+)\s*:\s*([^\s]+\.[a-zA-Z0-9]+)/);
+  if (langColon) return { lang: langColon[1].toLowerCase(), filename: langColon[2] };
+  // Bare filename-shaped token (`snake.html`, `src/main.rs`).
+  if (/^[a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+$/.test(raw)) return { lang: "", filename: raw };
+  // Bare language token (`python`, `c++`).
+  const first = raw.split(/\s+/)[0].toLowerCase();
+  if (/^[a-zA-Z0-9_+\-]+$/.test(first)) return { lang: first, filename: "" };
+  return { lang: "", filename: "" };
+}
+
+// Look in the line just before the fence for a filename hint. Matches:
+//   // index.html        // file: index.html
+//   # script.py           # file: script.py
+//   <!-- page.html -->
+//   **foo.c**             `bar.h`
+const FILENAME_HINT_RE = /(?:\/\/|#|<!--|\*\*|`)\s*(?:file:\s*)?([a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+)\s*(?:-->|\*\*|`)?\s*$/;
+
+// Best-effort extension sniff for naked fences. Reads the first non-blank
+// line and pattern-matches against well-known signatures. Falls back to
+// "txt" so the file is always downloadable even when we can't classify.
+function sniffExtension(body) {
+  const first = (body.split("\n").find((l) => l.trim()) || "").trim();
+  const lower = first.toLowerCase();
+  // Shebangs first — most decisive signal.
+  if (first.startsWith("#!/bin/bash") || first.startsWith("#!/usr/bin/env bash") || first.startsWith("#!/bin/sh") || first.startsWith("#!/usr/bin/env sh")) return "sh";
+  if (first.startsWith("#!/usr/bin/env python") || first.startsWith("#!/usr/bin/python")) return "py";
+  if (first.startsWith("#!/usr/bin/env node")) return "js";
+  if (first.startsWith("#!/usr/bin/env ruby")) return "rb";
+  // Markup / declarations.
+  if (lower.startsWith("<!doctype") || lower.startsWith("<html")) return "html";
+  if (first.startsWith("<?xml")) return "xml";
+  if (first.startsWith("<?php") || body.includes("<?php")) return "php";
+  if (first.startsWith("<svg")) return "svg";
+  // Language signatures detectable without parsing.
+  if (first.startsWith("package ") && body.includes("\nfunc ")) return "go";
+  if (first.startsWith("package ") && body.includes("\nimport ")) return "java";
+  if (first.startsWith("use ") && body.includes("\nfn ")) return "rs";
+  if (first.startsWith("fn ") || body.includes("\nfn main(")) return "rs";
+  // Python: imports, def, class — Pygame/Flask/etc. scripts rarely
+  // start with a shebang, so this signature catches the common case.
+  if (first.startsWith("import ") || first.startsWith("from ")) return "py";
+  if (first.startsWith("def ") || first.startsWith("class ") || body.includes("\ndef ") || body.includes("\nclass ")) return "py";
+  // JS/TS — function/const/let/var at top, or import/export ESM.
+  if (first.startsWith("function ") || /^(const|let|var) \w/.test(first)) return "js";
+  if (first.startsWith("export ") || (first.startsWith("import ") && first.includes(" from "))) return "js";
+  // CSS — selector { ... }.
+  if (/^[#.@*a-zA-Z][\w\-:,>\s\[\]"=()]*\{/.test(first)) return "css";
+  // JSON — opens/closes with brackets and parses cleanly.
+  const trimmed = body.trim();
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    try { JSON.parse(trimmed); return "json"; } catch { /* not strict JSON */ }
+  }
+  // YAML — `key: value` style with no JSON braces.
+  if (/^[a-zA-Z_][\w\-]*:\s/.test(first) && !trimmed.startsWith("{")) return "yaml";
+  return "txt";
+}
+
+function extractCodeBlocks(text) {
+  const blocks = [];
+  let counter = 0;
+  for (const match of text.matchAll(CODE_FENCE_FOR_DOWNLOAD_RE)) {
+    const info = match[1] || "";
+    const body = match[2] || "";
+    // op:<id> fences are confirm-card material, not files.
+    if (info.trim().toLowerCase().startsWith("op:")) continue;
+    const { lang, filename: infoFilename } = parseFenceInfo(info);
+    // Filename precedence (highest to lowest):
+    //   1. filename in the fence info string  (`file:foo.py`, `python:foo.py`)
+    //   2. filename hint on the line just before the fence (`**foo.py**`)
+    //   3. LANG_TO_FILENAME map (Dockerfile, Makefile, ...)
+    //   4. lang-derived `snippet-N.<ext>`
+    //   5. content-sniffed `snippet-N.<sniffed-ext>`
+    const before = text.slice(0, match.index).trimEnd();
+    const lastLine = before.slice(before.lastIndexOf("\n") + 1);
+    const hint = lastLine.match(FILENAME_HINT_RE);
+    // Gate naked fences (no lang, no filename anywhere): skip only the
+    // obvious one-line inline samples. Anything multi-line is plausibly
+    // an artifact — bias toward more buttons, not fewer.
+    const bodyLines = body.split("\n").filter((l) => l.length > 0).length;
+    const truly_naked = !lang && !infoFilename && !hint;
+    if (truly_naked && bodyLines < 2) continue;
+    counter++;
+    let filename;
+    if (infoFilename) {
+      filename = infoFilename;
+    } else if (hint && hint[1]) {
+      filename = hint[1];
+    } else if (LANG_TO_FILENAME[lang]) {
+      filename = LANG_TO_FILENAME[lang];
+    } else if (lang) {
+      const ext = LANG_TO_EXT[lang] || lang;
+      filename = `snippet-${counter}.${ext}`;
+    } else {
+      filename = `snippet-${counter}.${sniffExtension(body)}`;
+    }
+    blocks.push({ filename, body: body.replace(/\s+$/, "") + "\n", lang: lang || "text" });
+  }
+  return blocks;
+}
+
+function appendCodeDownloads(msgWrap, blocks) {
+  if (!msgWrap || !blocks.length) return;
+  const row = document.createElement("div");
+  row.className = "code-downloads";
+  for (const b of blocks) {
+    const blob = new Blob([b.body], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.className = "code-download";
+    a.href = url;
+    a.download = b.filename;
+    a.textContent = `⬇ ${b.filename}`;
+    a.title = `${b.body.length} bytes · ${b.lang || "text"}`;
+    if (IS_IOS_PWA) {
+      a.addEventListener("click", (e) => shareInsteadOfDownload(e, url, b.filename));
+    }
+    row.appendChild(a);
+  }
+  msgWrap.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
 function setStatsBusy(label) {
   if (!statsBar) return;
   statsBar.classList.remove("idle");
@@ -1125,6 +1319,11 @@ async function send() {
     }
     out.textContent = ` ${displayedText}`;
     history.push({ role: "assistant", content: displayedText });
+
+    // Surface any fenced code blocks (```html, ```py, etc.) as
+    // download buttons under the assistant bubble. Scans the same text
+    // the user sees, so what's displayed and what's downloaded match.
+    appendCodeDownloads(out.parentElement, extractCodeBlocks(displayedText));
 
     // One card at a time — y/n/e handler operates on a single pending card.
     // If the model emits multiple, queue them sequentially.
