@@ -36,6 +36,221 @@ skills:
   enabled: []  # filled in once the skill registry lands in v2
 
 # ──────────────────────────────────────────────────────────────────
+# Storage — workspace is internal (chat-linked); output_dir is the
+# host-visible mirror for model-produced files. Set output_dir to
+# null/empty to disable the mirror.
+# ──────────────────────────────────────────────────────────────────
+storage:
+  workspace: workspaces
+  output_dir: ~/Downloads/wyltek-gpt-output
+
+# ──────────────────────────────────────────────────────────────────
+# Auto-router — specialised request paths that bypass the selected
+# chat model. Currently just captioning: when a user uploads an image
+# and asks a describe-y question, the request gets routed to a
+# dedicated captioner model regardless of which chat model is selected.
+#
+# captioner_model: name in `ollama list`. Empty disables auto-routing.
+# ──────────────────────────────────────────────────────────────────
+auto_router:
+  captioner_model: qwen3-omni-captioner:30b-a3b-q4
+
+# ──────────────────────────────────────────────────────────────────
+# Bridges — external services the model can reach via fixed-shape
+# bridge modules. Each bridge is health-probed at startup; operations
+# that depend on an offline bridge are soft-disabled (same pattern as
+# missing converter binaries). Never put model-supplied input into a
+# bridge URL.
+# ──────────────────────────────────────────────────────────────────
+bridges:
+  open_palette:
+    url: http://localhost:7860
+    probe: /api/backends
+    timeout: 600
+
+# ──────────────────────────────────────────────────────────────────
+# Operations — model-invoked file editing + generation.
+#
+# Two kinds:
+#   - kind: local   — runs a host binary via fixed argv template.
+#                     {source}, {output}, {out_dir}, {stem}, plus any
+#                     declared param name are slot-substituted with
+#                     validated values.
+#   - kind: bridge  — proxied to a configured bridge. The bridge
+#                     module owns the wire protocol; this entry only
+#                     declares param schema + which bridge to use.
+#
+# Param types: enum, int_range, float_range, timestamp, text, dimension.
+# Every param value the model supplies is validated before subprocess
+# or HTTP call. Validation failures bubble back to the model so it can
+# self-correct on retry.
+#
+# Phase 1 ships two operations as proof-of-architecture: trim_video
+# (local ffmpeg) and generate_image (open-palette bridge with prompt
+# enhancement). Add more operations by appending entries.
+# ──────────────────────────────────────────────────────────────────
+operations:
+  - id: trim_video
+    kind: local
+    requires: ffmpeg
+    description: >
+      Trim a video to a time range. Lossless — stream-copies codec, no
+      re-encode. Pass start and end as HH:MM:SS, MM:SS, or seconds.
+    source_param: source
+    accepts: [mp4, mkv, mov, webm, avi, m4v, flv]
+    output_ext_from_source: true
+    timeout: 300
+    params:
+      start:
+        type: timestamp
+        required: true
+        description: Start of the kept range (HH:MM:SS, MM:SS, or seconds).
+      end:
+        type: timestamp
+        required: true
+        description: End of the kept range (HH:MM:SS, MM:SS, or seconds).
+    argv:
+      [ffmpeg, -y, -ss, "{start}", -to, "{end}", -i, "{source}",
+       -c, copy, -avoid_negative_ts, make_zero, "{output}"]
+
+  - id: scale_image
+    kind: local
+    requires: vipsthumbnail
+    description: >
+      Scale an image to a target maximum dimension (preserves aspect ratio).
+      Output extension matches the input. Pass max_size in pixels (longest side).
+    source_param: source
+    accepts: [jpg, jpeg, png, webp, tiff, tif, gif, bmp]
+    output_ext_from_source: true
+    timeout: 60
+    params:
+      max_size:
+        type: int_range
+        min: 16
+        max: 8192
+        required: true
+        description: Longest side in pixels. Smaller side scales to preserve aspect ratio.
+    argv: [vipsthumbnail, "{source}", --size, "{max_size}", -o, "{output}"]
+
+  - id: requantize_image
+    kind: local
+    requires: ffmpeg
+    description: >
+      Re-encode an image to JPEG at a chosen quality level (1-100).
+      Output is always .jpg. Use to shrink file size or convert to JPEG.
+    source_param: source
+    accepts: [jpg, jpeg, png, webp, tiff, tif, bmp]
+    output_ext: jpg
+    timeout: 60
+    params:
+      quality:
+        type: int_range
+        min: 1
+        max: 100
+        required: true
+        description: JPEG quality. 50-75 is small, 85-95 is high.
+    argv: [ffmpeg, -y, -i, "{source}", -q:v, "{quality}", "{output}"]
+
+  - id: extract_audio
+    kind: local
+    requires: ffmpeg
+    description: >
+      Extract the audio track from a video as MP3 at a chosen bitrate.
+    source_param: source
+    accepts: [mp4, mkv, mov, webm, avi, m4v, flv]
+    output_ext: mp3
+    timeout: 600
+    params:
+      bitrate:
+        type: enum
+        choices: ["64k", "96k", "128k", "192k", "256k", "320k"]
+        default: "128k"
+        description: MP3 bitrate. 128k is balanced.
+    argv: [ffmpeg, -y, -i, "{source}", -vn, -b:a, "{bitrate}", "{output}"]
+
+  - id: trim_audio
+    kind: local
+    requires: ffmpeg
+    description: >
+      Trim an audio file to a time range. Lossless — stream-copies codec.
+    source_param: source
+    accepts: [mp3, m4a, ogg, opus, wav, flac, aac]
+    output_ext_from_source: true
+    timeout: 300
+    params:
+      start:
+        type: timestamp
+        required: true
+        description: Start of the kept range (HH:MM:SS, MM:SS, or seconds).
+      end:
+        type: timestamp
+        required: true
+        description: End of the kept range (HH:MM:SS, MM:SS, or seconds).
+    argv:
+      [ffmpeg, -y, -ss, "{start}", -to, "{end}", -i, "{source}",
+       -c, copy, "{output}"]
+
+  - id: generate_image
+    kind: bridge
+    bridge: open_palette
+    enhance: true
+    description: >
+      Generate an image from a text prompt using the local image-gen
+      backend (open-palette / ComfyUI). The prompt is strengthened by
+      the active chat model first, with a Y/N/E confirm card before
+      the GPU job runs.
+    params:
+      prompt:
+        type: text
+        required: true
+        max_len: 2000
+        description: What to generate. Plain English — the system enhances it.
+      negative_prompt:
+        type: text
+        max_len: 1000
+        default: ""
+        description: Things to avoid. Usually filled by the enhancer.
+      width:
+        type: dimension
+        choices: [512, 768, 1024, 1536]
+        default: 1024
+      height:
+        type: dimension
+        choices: [512, 768, 1024, 1536]
+        default: 1024
+      steps:
+        type: int_range
+        min: 10
+        max: 60
+        default: 30
+        description: Diffusion steps. 30 is the sweet spot.
+      cfg_scale:
+        type: float_range
+        min: 1.0
+        max: 15.0
+        default: 7.0
+        description: Prompt adherence. 7 is default; lower = freer, higher = stricter.
+      backend:
+        type: enum
+        choices: [comfyui]
+        default: comfyui
+      model:
+        type: text
+        max_len: 200
+        default: ""
+        description: Open-palette model name. Empty = use bridge default.
+      mode:
+        type: enum
+        choices: [auto, sdxl, flux, pixel, anime]
+        default: auto
+        description: >
+          Override the enhance branch. 'auto' detects from the model
+          name (flux/pixel/anime substrings); falls back to sdxl.
+    bridge_call:
+      endpoint: /api/generate
+      poll: /api/job/{job_id}
+
+# ──────────────────────────────────────────────────────────────────
 # Converter registry
 # ──────────────────────────────────────────────────────────────────
 # Each entry is a deterministic file conversion: source extension(s)
@@ -173,7 +388,8 @@ converters:
     from: [mp4, mkv, mov, webm, avi, m4v, flv]
     to: mp4
     requires: ffmpeg
-    argv: [ffmpeg, -y, -i, "{input}", -c:v, libx264, -crf, "{quality}", -preset, fast,
+    argv: [ffmpeg, -y, -i, "{input}", -vf, "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+           -c:v, libx264, -crf, "{quality}", -preset, fast,
            -c:a, aac, -b:a, 128k, -movflags, +faststart, "{output}"]
     timeout: 1800
     params:
@@ -279,18 +495,17 @@ converters:
     argv: [ffmpeg, -y, -i, "{input}", "{output}"]
     timeout: 600
 
-  - id: whisper_transcribe
+  - id: qwen3_asr_transcribe
     from: [mp3, wav, m4a, flac, ogg, mp4, mkv, webm]
     to: txt
-    requires: whisper
-    argv: [whisper, "{input}", --model, "{model}", --output_dir, "{out_dir}", --output_format, txt]
+    requires: qwen3-asr-transcribe
+    argv: [qwen3-asr-transcribe, --input, "{input}", --output, "{output}", --model, "{model}"]
     timeout: 1800
     params:
       model:
         label: Model
-        default: base
+        default: "1.7B"
         choices:
-          - {value: tiny, label: "tiny (fastest)"}
-          - {value: base, label: "base (balanced)"}
-          - {value: small, label: "small"}
-          - {value: medium, label: "medium (most accurate)"}
+          # Model size is controlled by the worker's QWEN3_ASR_MODEL_SIZE env var.
+          # To switch to 0.6B: systemctl --user edit qwen3-asr-worker.service
+          - {value: "1.7B", label: "Qwen3-ASR 1.7B (accurate)"}

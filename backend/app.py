@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
+import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -11,8 +15,19 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.bridges import open_palette
+from backend.capabilities import CapabilityCache
 from backend.converters import Registry, run_conversion
+from backend.enhance import enhance_prompt
 from backend.host_context import host_context_block
+from backend.operations import (
+    Operation,
+    OperationRegistry,
+    make_converter_operation,
+    run_local,
+    validate_params,
+)
+from backend.output_copy import copy_to_output
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("local-chatbot")
@@ -20,27 +35,213 @@ log = logging.getLogger("local-chatbot")
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text())
 OLLAMA_URL = CONFIG["ollama"]["url"]
-WORKSPACE = ROOT / "workspaces"
-WORKSPACE.mkdir(exist_ok=True)
 
+# ─── Storage paths ────────────────────────────────────────────────────
+STORAGE = CONFIG.get("storage") or {}
+WORKSPACE = ROOT / STORAGE.get("workspace", "workspaces")
+WORKSPACE.mkdir(exist_ok=True)
+_OUT_RAW = STORAGE.get("output_dir")
+OUTPUT_DIR: Path | None = (
+    Path(os.path.expanduser(_OUT_RAW)).resolve() if _OUT_RAW else None
+)
+if OUTPUT_DIR is not None:
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        log.info("output mirror: %s", OUTPUT_DIR)
+    except OSError as exc:
+        log.warning("output mirror unavailable (%s): %s", OUTPUT_DIR, exc)
+        OUTPUT_DIR = None
+
+# ─── Converter registry (existing) ───────────────────────────────────
 REGISTRY = Registry(CONFIG.get("converters", []))
 log.info("converters: %d enabled, %d disabled", len(REGISTRY.enabled), len(REGISTRY.missing))
+
+# ─── Bridges + operations registry (new) ─────────────────────────────
+BRIDGES_CFG: dict = CONFIG.get("bridges") or {}
+
+
+def _probe_bridges_sync() -> set[str]:
+    """Health-probe every configured bridge at startup. Returns ids that responded."""
+    available: set[str] = set()
+    for bridge_id, cfg in BRIDGES_CFG.items():
+        ok = open_palette.health_probe(
+            cfg["url"], cfg.get("probe", "/"), timeout=10.0,
+        )
+        if ok:
+            available.add(bridge_id)
+            log.info("bridge '%s' available at %s", bridge_id, cfg["url"])
+        else:
+            log.warning("bridge '%s' not responding at %s — bridge ops disabled",
+                        bridge_id, cfg["url"])
+    return available
+
+
+_BRIDGES_AVAILABLE = _probe_bridges_sync()
+OPERATIONS = OperationRegistry(CONFIG.get("operations", []), _BRIDGES_AVAILABLE)
+
+# Synthetic op: wraps the converter registry. Computed at startup so the
+# target-extension enum reflects what's actually installed.
+_REACHABLE_TARGETS: set[str] = set()
+for _conv in REGISTRY.enabled:
+    _REACHABLE_TARGETS.update(_conv.targets)
+if _REACHABLE_TARGETS:
+    OPERATIONS.add(make_converter_operation(tuple(sorted(_REACHABLE_TARGETS))))
+
+log.info("operations: %d enabled, %d disabled", len(OPERATIONS.enabled), len(OPERATIONS.missing))
+
+# Capability cache — persisted across restarts. Probes run lazily on
+# first model selection, never eagerly at startup (would force a
+# 20-40min model thrash through every installed Ollama model).
+CAPABILITIES = CapabilityCache(ROOT / "data" / "capabilities.json", OLLAMA_URL)
 
 app = FastAPI(title="local-chatbot")
 
 
+@app.on_event("startup")
+async def _eager_probe_on_startup():
+    """If the capability cache is empty (or just wiped), probe all
+    installed Ollama models in the background. Cheap now that probing
+    is metadata-based — ~50ms per model."""
+    if CAPABILITIES.all():
+        return  # already populated
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{OLLAMA_URL}/api/tags")
+            r.raise_for_status()
+        names = [m["name"] for m in r.json().get("models", [])]
+    except httpx.HTTPError as exc:
+        log.warning("startup auto-probe skipped (Ollama unreachable): %s", exc)
+        return
+    log.info("auto-probing %d Ollama models on startup (metadata only)", len(names))
+    await CAPABILITIES.probe_models(names)
+    log.info("startup auto-probe complete")
+
+
+# ─── System prompt assembly ──────────────────────────────────────────
+
+
+def _operations_prompt_block() -> str:
+    """Tells the model what operations exist + how to invoke via the structured fallback.
+
+    Models with native tool-calling support get the same operation list as
+    Ollama tools (see /api/chat). Models without it parse this block out
+    of the system prompt and emit ``op:<name> {...}`` blocks themselves.
+    """
+    if not OPERATIONS.enabled:
+        return ""
+    lines = [
+        "",
+        "## File-processing operations (USE THESE — do not give shell instructions)",
+        "",
+        "When the user asks you to process, convert, edit, trim, or generate a file,",
+        "you MUST invoke one of the operations below — never tell the user to run",
+        "ffmpeg/imagemagick/etc. themselves. The system runs the operation locally",
+        "and posts the resulting file back into the chat as a download link.",
+        "",
+        "To invoke, emit a fenced block exactly like this (one block per call):",
+        "",
+        "```op:<operation_id>",
+        '{"param_name": "value", ...}',
+        "```",
+        "",
+        "The user sees a Y/N/E confirm card before the operation runs, so a",
+        "wrong call is recoverable. Do NOT invent operation ids or parameter",
+        "names — only use what's listed here. If the user uploaded a file, its",
+        "name appears in an earlier system message; pass that exact filename as",
+        "the source param.",
+        "",
+        "Available operations:",
+    ]
+    for op in OPERATIONS.enabled:
+        param_summary = ", ".join(
+            f"{p.name}{'?' if not p.required else ''}" for p in op.params
+        )
+        lines.append(f"- {op.id}({param_summary}) — {op.description.strip()}")
+    return "\n".join(lines)
+
+
 def _full_system_prompt() -> str:
-    """Base prompt from config.yaml + dynamically-gathered host facts.
-    Built fresh per call so date/time stay current across long-running sessions."""
-    return CONFIG["assistant"]["system_prompt"] + host_context_block()
+    """Base prompt + dynamic host facts + operations manifest."""
+    return (
+        CONFIG["assistant"]["system_prompt"]
+        + host_context_block()
+        + _operations_prompt_block()
+    )
+
+
+# ─── Existing endpoints (config / themes / models / chat / converters) ──
 
 
 @app.get("/api/config")
 async def get_config():
+    auto = CONFIG.get("auto_router") or {}
     return {
         "default_theme": CONFIG["ui"]["default_theme"],
         "system_prompt": _full_system_prompt(),
+        "auto_router": {
+            "captioner_model": auto.get("captioner_model", ""),
+        },
     }
+
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif")
+
+
+@app.post("/api/auto-caption")
+async def auto_caption(payload: dict):
+    """Specialised path: route an uploaded image + caption-y prompt to a
+    dedicated captioner model regardless of which chat model the user
+    has selected. Streams the captioner's response in the same format
+    as /api/chat so the frontend treats it identically.
+
+    Triggered by frontend heuristic (caption-intent regex + image file).
+    Returns 503 if no captioner is configured."""
+    auto = CONFIG.get("auto_router") or {}
+    captioner = payload.get("captioner_model") or auto.get("captioner_model", "")
+    if not captioner:
+        raise HTTPException(503, "no captioner_model configured in auto_router")
+
+    session_id = payload.get("session_id", "default")
+    source = payload.get("source")
+    prompt = (payload.get("prompt") or "Describe this image in detail.").strip()
+    if not source:
+        raise HTTPException(400, "missing 'source' (uploaded filename)")
+
+    _, image_path = _resolve_in_workspace(session_id, source)
+    if not image_path.exists():
+        raise HTTPException(404, f"image not found: {source}")
+    if image_path.suffix.lower() not in _IMAGE_EXTS:
+        raise HTTPException(400, f"source {source} is not a supported image type")
+
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+    body = {
+        "model": captioner,
+        "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+        "stream": True,
+    }
+
+    async def stream():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=body) as r:
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                    yield f"\n[captioner error: HTTP {r.status_code}: {raw}]"
+                    return
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = (data.get("message") or {}).get("content")
+                    if chunk:
+                        yield chunk
+                    if data.get("done"):
+                        return
+
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
 @app.get("/api/themes")
@@ -61,33 +262,90 @@ async def list_models():
 
 @app.post("/api/chat")
 async def chat(payload: dict):
+    """Streaming chat. Forwards Ollama tool definitions when available so
+    capable models can emit native tool_calls; less-capable models emit
+    structured ``op:<name> {...}`` blocks parsed client-side instead."""
     model = payload.get("model")
     incoming = payload.get("messages", [])
     if not model or not incoming:
         raise HTTPException(400, "Missing 'model' or 'messages'")
 
-    # Strip any system messages the client sent and prepend a freshly-built
-    # one. Backend is the single source of truth for the system prompt so
-    # facts like the current date never go stale during long sessions.
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
 
-    async def stream():
+    body_with_tools: dict = {"model": model, "messages": messages, "stream": True}
+    if OPERATIONS.enabled:
+        body_with_tools["tools"] = OPERATIONS.tool_schemas()
+    body_without_tools: dict = {"model": model, "messages": messages, "stream": True}
+
+    async def _stream_one(body: dict):
+        """Stream one POST to Ollama. Yields:
+            ('chunk', str)           — model text chunks
+            ('tool_calls', list)     — final tool_calls payload, if any
+            ('error', dict)          — Ollama returned non-2xx; dict has 'status' + 'error'
+            ('done', None)           — stream completed normally
+        """
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_URL}/api/chat",
-                json={"model": model, "messages": messages, "stream": True},  # noqa: B023
-            ) as r:
+            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=body) as r:
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                    try:
+                        err = json.loads(raw).get("error", raw)
+                    except json.JSONDecodeError:
+                        err = raw
+                    yield "error", {"status": r.status_code, "error": err}
+                    return
                 async for line in r.aiter_lines():
                     if not line:
                         continue
-                    data = json.loads(line)
-                    chunk = data.get("message", {}).get("content")
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = data.get("message", {}) or {}
+                    chunk = msg.get("content")
                     if chunk:
-                        yield chunk
+                        yield "chunk", chunk
+                    tool_calls = msg.get("tool_calls")
+                    if tool_calls:
+                        yield "tool_calls", tool_calls
                     if data.get("done"):
+                        yield "done", None
                         return
+                yield "done", None
+
+    async def stream():
+        # First attempt: with tools. If Ollama rejects (the model doesn't
+        # support function-calling), retry without — the structured ``op:``
+        # fence parser still works, that's the whole point of the hybrid.
+        attempted_fallback = False
+        async for kind, value in _stream_one(body_with_tools):
+            if kind == "chunk":
+                yield value
+            elif kind == "tool_calls":
+                yield "\n" + json.dumps({"__tool_calls__": value})
+            elif kind == "error":
+                err_msg = str(value.get("error", "")).lower()
+                if (not attempted_fallback
+                        and "tools" in err_msg
+                        and OPERATIONS.enabled):
+                    log.info("model %s rejected tools — retrying without", model)
+                    attempted_fallback = True
+                    async for k2, v2 in _stream_one(body_without_tools):
+                        if k2 == "chunk":
+                            yield v2
+                        elif k2 == "tool_calls":
+                            yield "\n" + json.dumps({"__tool_calls__": v2})
+                        elif k2 == "error":
+                            yield f"\n[backend error: Ollama {v2['status']}: {v2['error']}]"
+                            return
+                        elif k2 == "done":
+                            return
+                    return
+                yield f"\n[backend error: Ollama {value['status']}: {value['error']}]"
+                return
+            elif kind == "done":
+                return
 
     return StreamingResponse(stream(), media_type="text/plain")
 
@@ -96,16 +354,309 @@ async def chat(payload: dict):
 async def list_converters():
     return {
         "enabled": [
-            {
-                "id": c.id,
-                "from": list(c.sources),
-                "to": list(c.targets),
-                "params": c.params,
-            }
+            {"id": c.id, "from": list(c.sources), "to": list(c.targets), "params": c.params}
             for c in REGISTRY.enabled
         ],
         "disabled": [{"id": cid, "missing": req} for cid, req in REGISTRY.missing],
     }
+
+
+# ─── Operations API ──────────────────────────────────────────────────
+
+
+@app.get("/api/operations")
+async def list_operations():
+    return {
+        "enabled": [op.to_client_dict() for op in OPERATIONS.enabled],
+        "disabled": [{"id": oid, "reason": reason} for oid, reason in OPERATIONS.missing],
+        "bridges_available": sorted(_BRIDGES_AVAILABLE),
+        "output_dir": str(OUTPUT_DIR) if OUTPUT_DIR else None,
+    }
+
+
+@app.get("/api/capabilities")
+async def get_all_capabilities():
+    """Return the full capabilities cache. Frontend uses this to render
+    glyphs in the model dropdown and decide which models need a probe."""
+    return CAPABILITIES.all()
+
+
+@app.get("/api/capabilities/{model:path}")
+async def get_one_capability(model: str):
+    """Return one model's capabilities, or 404 if not yet probed."""
+    caps = CAPABILITIES.get(model)
+    if caps is None:
+        raise HTTPException(404, f"capabilities for {model!r} not yet probed")
+    return caps
+
+
+@app.post("/api/capabilities/probe")
+async def probe_capability(payload: dict):
+    """Probe one model via Ollama's /api/show metadata. Fast (<100ms)."""
+    model = payload.get("model")
+    if not model:
+        raise HTTPException(400, "missing 'model'")
+    return await CAPABILITIES.probe_now(model)
+
+
+@app.post("/api/capabilities/probe-all")
+async def probe_all_known():
+    """Sweep every model currently in `ollama list` and probe each.
+    Wipes existing cache first so stale entries from the old inference-
+    based probe don't survive. Fast — ~50ms per model."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{OLLAMA_URL}/api/tags")
+            r.raise_for_status()
+        names = [m["name"] for m in r.json().get("models", [])]
+    except httpx.HTTPError as e:
+        raise HTTPException(503, f"Ollama unreachable: {e}")
+    # Clear old (potentially-bogus) cache entries before re-populating.
+    async with CAPABILITIES._lock:
+        CAPABILITIES._cache = {}
+        CAPABILITIES._save()
+    return await CAPABILITIES.probe_models(names)
+
+
+@app.post("/api/operations/enhance")
+async def enhance(payload: dict):
+    """Strengthen a free-form image prompt using the user's chat model.
+
+    Returns ``{enhanced_prompt, negative_prompt, changes, mode, original_prompt}``.
+    Always returns 200 — on failure the original prompt comes back
+    unchanged with ``mode="passthrough"``."""
+    user_prompt = (payload.get("prompt") or "").strip()
+    chat_model = payload.get("chat_model") or ""
+    if not user_prompt:
+        raise HTTPException(400, "missing 'prompt'")
+    if not chat_model:
+        raise HTTPException(400, "missing 'chat_model'")
+    return await enhance_prompt(
+        ollama_url=OLLAMA_URL,
+        chat_model=chat_model,
+        user_prompt=user_prompt,
+        image_model=payload.get("image_model") or "",
+        explicit_mode=payload.get("mode") if payload.get("mode") != "auto" else None,
+    )
+
+
+_LANG_CODE_RE = re.compile(r"^[a-z]{2}(?:[-_][A-Za-z]{2,4})?$")
+_TRANSLATE_MAX_TEXT_CHARS = 8000
+_TRANSLATE_DEFAULT_NUM_CTX = 2048
+
+
+@app.post("/api/operations/translate")
+async def translate(payload: dict):
+    """Translate text via a model that expects the TranslateGemma T3
+    structured chat-template envelope.
+
+    Wraps user content in ``{"type":"text","source_lang_code":...,
+    "target_lang_code":...,"text":...}`` and posts to Ollama directly,
+    skipping the standard system-prompt assembly that would otherwise
+    knock the model out of pure-translation mode.
+
+    Streams chunks in the same text/plain format as /api/chat and
+    /api/auto-caption so the frontend reuses its existing render path.
+
+    Caps num_ctx at 2048 by default so the 27 B Q4_K_M fits on a 24 GB
+    card; caller may override via 'num_ctx' at their own VRAM risk.
+    """
+    model = (payload.get("model") or "").strip()
+    source_lang = (payload.get("source_lang") or "").strip()
+    target_lang = (payload.get("target_lang") or "").strip()
+    text = payload.get("text") or ""
+
+    if not model:
+        raise HTTPException(400, "missing 'model'")
+    if not _LANG_CODE_RE.match(source_lang):
+        raise HTTPException(
+            400,
+            f"invalid 'source_lang': {source_lang!r} "
+            "(expected ISO 639-1 like 'en' or 'pt-BR')",
+        )
+    if not _LANG_CODE_RE.match(target_lang):
+        raise HTTPException(
+            400,
+            f"invalid 'target_lang': {target_lang!r} "
+            "(expected ISO 639-1 like 'es' or 'zh-Hans')",
+        )
+    if not text.strip():
+        raise HTTPException(400, "missing 'text'")
+    if len(text) > _TRANSLATE_MAX_TEXT_CHARS:
+        raise HTTPException(
+            413,
+            f"text too long ({len(text)} chars > {_TRANSLATE_MAX_TEXT_CHARS}); "
+            "split into smaller chunks",
+        )
+
+    envelope = json.dumps(
+        {
+            "type": "text",
+            "source_lang_code": source_lang,
+            "target_lang_code": target_lang,
+            "text": text,
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        num_ctx = int(payload.get("num_ctx") or _TRANSLATE_DEFAULT_NUM_CTX)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "'num_ctx' must be an integer")
+
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": envelope}],
+        "stream": True,
+        "options": {"num_ctx": num_ctx, "temperature": 0.1},
+        "keep_alive": payload.get("keep_alive", "5m"),
+    }
+
+    async def stream():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=body) as r:
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                    yield f"\n[translate error: HTTP {r.status_code}: {raw}]"
+                    return
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = (data.get("message") or {}).get("content")
+                    if chunk:
+                        yield chunk
+                    if data.get("done"):
+                        return
+
+    return StreamingResponse(stream(), media_type="text/plain")
+
+
+@app.post("/api/operations/run")
+async def run_operation(payload: dict):
+    """Execute a model-requested operation. Always called *after* the
+    user has confirmed the Y/N/E card in the UI — never auto-fired
+    from /api/chat directly. Returns the resulting workspace file."""
+    op_id = payload.get("operation")
+    if not op_id:
+        raise HTTPException(400, "missing 'operation'")
+    op = OPERATIONS.find(op_id)
+    if op is None:
+        raise HTTPException(404, f"operation {op_id!r} not found or disabled")
+
+    session_id = payload.get("session_id", "default")
+    session_dir, _ = _resolve_in_workspace(session_id, "_")
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_params = payload.get("params") or {}
+    if not isinstance(raw_params, dict):
+        raise HTTPException(400, "'params' must be an object")
+
+    try:
+        validated = validate_params(op, raw_params)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if op.kind == "local":
+        out = await _run_local_op(op, session_dir, payload, validated)
+    elif op.kind == "bridge":
+        out = await _run_bridge_op(op, session_dir, validated)
+    elif op.kind == "converter":
+        out = await _run_converter_op(session_dir, validated)
+    else:
+        raise HTTPException(500, f"unknown op kind {op.kind!r}")
+
+    mirrored = copy_to_output(out, OUTPUT_DIR)
+    return {
+        "name": out.name,
+        "session_id": session_id,
+        "size": out.stat().st_size,
+        "via": op.id,
+        "kind": op.kind,
+        "mirror": str(mirrored) if mirrored else None,
+        "url": f"/api/files/{session_id}/{out.name}",
+    }
+
+
+async def _run_local_op(
+    op: Operation, session_dir: Path, payload: dict, validated: dict[str, str],
+) -> Path:
+    source_path: Path | None = None
+    source_name = payload.get("source")
+    if source_name:
+        _, source_path = _resolve_in_workspace(payload.get("session_id", "default"), source_name)
+        if not source_path.exists():
+            raise HTTPException(404, f"source file not found: {source_name}")
+    elif op.source_param:
+        # Operations that declare a source_param need a file. Bail clearly.
+        raise HTTPException(400, f"operation {op.id} needs a 'source' file")
+
+    try:
+        return await asyncio.to_thread(run_local, op, session_dir, source_path, validated)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"{op.id} timed out")
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(500, str(e))
+
+
+async def _run_converter_op(
+    session_dir: Path, validated: dict[str, str],
+) -> Path:
+    """Dispatch the synthetic ``convert`` op through the existing converter
+    registry. The model picks source filename + target extension; we look
+    up the right converter and run it through the same code path the
+    user-tray UI uses."""
+    source_name = validated["source"]
+    target_ext = validated["target"].lstrip(".").lower()
+    _, input_path = _resolve_in_workspace(session_dir.name, source_name)
+    if not input_path.exists():
+        raise HTTPException(404, f"file not found in workspace: {source_name}")
+    src_ext = input_path.suffix.lstrip(".").lower()
+    converter = REGISTRY.find(src_ext, target_ext)
+    if not converter:
+        reachable = sorted(REGISTRY.reachable_from(src_ext))
+        raise HTTPException(
+            400,
+            f"no converter for .{src_ext} → .{target_ext}. "
+            f"From .{src_ext} you can reach: {reachable or '(nothing)'}",
+        )
+    try:
+        return await asyncio.to_thread(
+            run_conversion, converter, input_path, session_dir, target_ext, {},
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"{converter.id} timed out")
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(500, str(e))
+
+
+async def _run_bridge_op(
+    op: Operation, session_dir: Path, validated: dict[str, str],
+) -> Path:
+    if op.bridge != "open_palette":
+        raise HTTPException(500, f"unknown bridge {op.bridge!r}")
+    bridge_cfg = BRIDGES_CFG.get(op.bridge) or {}
+    base_url = bridge_cfg.get("url")
+    if not base_url:
+        raise HTTPException(503, f"bridge {op.bridge} not configured")
+    # Strip the chat-only ``mode`` slot before forwarding to open-palette
+    # (it doesn't recognise it).
+    forward = {k: v for k, v in validated.items() if k != "mode"}
+    try:
+        return await open_palette.generate_image(
+            base_url=base_url,
+            params=forward,
+            workspace=session_dir,
+            overall_timeout=float(bridge_cfg.get("timeout", 600)),
+        )
+    except open_palette.BridgeUnavailable as e:
+        raise HTTPException(502, str(e))
+
+
+# ─── Workspace helpers + uploads + downloads ──────────────────────────
 
 
 def _resolve_in_workspace(session_id: str, name: str) -> tuple[Path, Path]:
@@ -178,11 +729,13 @@ async def convert(payload: dict):
     except (RuntimeError, ValueError) as e:
         raise HTTPException(500, str(e))
 
+    mirrored = copy_to_output(out, OUTPUT_DIR)
     return {
         "name": out.name,
         "session_id": session_id,
         "size": out.stat().st_size,
         "via": converter.id,
+        "mirror": str(mirrored) if mirrored else None,
     }
 
 
@@ -223,7 +776,6 @@ async def share_target(
 
 @app.get("/sw.js")
 async def service_worker():
-    # Served from root so its scope covers the whole site, not just /static/.
     return FileResponse(
         ROOT / "frontend" / "sw.js",
         media_type="application/javascript",

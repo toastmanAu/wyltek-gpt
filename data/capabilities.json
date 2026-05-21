@@ -1,0 +1,346 @@
+{
+  "carnice-9b:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "carnice-v2:27b-q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "ckb-expert-0.5b-docs:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "ckb-expert-0.5b-full:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "ckb-expert-0.6b:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "devstral-small-2:24b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "gemma3n:e4b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "gemma4:26b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "gemma4:31b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "gemma4:e4b": {
+    "audio": true,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "glm-4.7-flash:latest": {
+    "audio": false,
+    "last_probed": "2026-05-21T07:04:45+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "gpt-oss:20b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "granite4:7b-a1b-h": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "haervwe/GLM-4.6V-Flash-9B:latest": {
+    "audio": false,
+    "last_probed": "2026-05-21T06:46:51+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "hermes3:8b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "hf.co/mradermacher/translategemma-12b-it-GGUF:Q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-05-21T07:06:51+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "hf.co/mradermacher/translategemma-27b-it-GGUF:Q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-05-21T07:06:47+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "hf.co/mradermacher/translategemma-4b-it-GGUF:Q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-05-21T07:06:56+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "lfm2.5-thinking:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "llama3.1:8b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "mistral-small3.2:24b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "moondream:latest": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "qwen2.5:14b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "qwen3-coder:30b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "qwen3-omni-captioner:30b-a3b-q4": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "qwen3-vl:30b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "qwen3-vl:8b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "qwen3.5:35b-a3b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "qwen3.5:9b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:07+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "qwen3.6-opus-distill:35b-a3b-q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "qwen3.6-vl:27b-q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "qwen3.6:27b": {
+    "audio": false,
+    "last_probed": "2026-05-21T07:04:48+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "qwen3.6:35b-a3b-q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
+  "qwen3:14b": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:08+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": false
+  },
+  "qwopus-glm:18b-q6_K": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:06+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": false
+  },
+  "qwopus3.5:27b-q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-04-26T18:02:05+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-12b-en-ja:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:42+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-27b-en-ja:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:40+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-4b-en-es:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:44+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-4b-en-fr:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:45+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-4b-en-ja:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:49+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-4b-en-zh:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:15+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  },
+  "translategemma-4b-ja-en:latest": {
+    "audio": false,
+    "last_probed": "2026-05-12T15:45:47+00:00",
+    "probe_count": 1,
+    "reasoning": false,
+    "tool_calling": "rejected",
+    "vision": true
+  }
+}

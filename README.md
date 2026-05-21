@@ -149,6 +149,57 @@ Everything lives in `config.yaml`:
 - Missing converter binaries are soft-skipped at startup (logged warning),
   so the enabled list shown to the model/UI is always the truth.
 
+## Model capability manifest
+
+wyltek-gpt probes every Ollama model the first time you select it and records
+what it can do. The result drives capability glyphs in the model dropdown
+and an in-card warning when a model is asked to do something it lacks the
+capability for. Cache lives at `data/capabilities.json`.
+
+### Glyph language
+
+| Glyph | Capability | Meaning |
+|-------|-----------|---------|
+| ⚒ | tool calling (native) | Model emits valid `tool_calls` when given a `tools=[]` parameter |
+| ⚙ | tool calling (ignored) | Model accepts the `tools=[]` parameter but doesn't invoke anything — falls back to the structured `op:<name>` fence path |
+| 👁 | vision | Model accepts inline base64 images and produces sensible descriptions |
+| 🎙 | audio | Model accepts audio inputs (always false for Ollama-served models — Ollama's chat API doesn't accept audio) |
+| 🧠 | reasoning | Model emits `<think>` blocks during its response (Qwen3 distill, DeepSeek R1, etc.) |
+| ❓ | unknown | Not yet probed — first selection triggers the probe |
+| · | probed, none of the above | Pure text-output model, no detected capabilities beyond chat |
+
+### How probing works
+
+1. Probes are **lazy** — the first time you pick a model in the dropdown, the
+   backend runs three probes against it (tool calling, vision, reasoning).
+   Audio is hardcoded `false` because Ollama's chat API doesn't accept it.
+2. Each probe is a single chat request to Ollama with a minimal prompt
+   tailored to that capability axis.
+3. Results are cached in `data/capabilities.json` and never re-probed
+   automatically — use the **Re-probe selected model** button in the
+   settings drawer after `ollama pull`-ing an updated model.
+4. Frontend shows a "first-run capability probe" notification with a
+   spinner and elapsed-seconds counter while a probe is in flight.
+
+### Operations declare what they need
+
+Each operation in `config.yaml` has a `capabilities_required` list:
+
+```yaml
+operations:
+  - id: trim_video
+    capabilities_required: [text]      # universal — every model satisfies
+
+  - id: caption_image                  # hypothetical
+    capabilities_required: [text, vision]
+```
+
+When you ask the model to invoke an op whose `capabilities_required` exceeds
+the selected model's capabilities, the confirm card shows a yellow warning
+strip listing what's missing and which probed models DO have it. **Y still
+runs the op** — the gate is warn-and-allow, not block-and-redirect, because
+some failures are environmental and the user gets to decide.
+
 ## Roadmap
 
 Done:

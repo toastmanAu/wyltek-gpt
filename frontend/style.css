@@ -116,6 +116,43 @@ body {
 }
 .settings-danger:hover { background: var(--error); color: var(--bg-0); }
 .settings-hint { font-size: 0.78em; color: var(--fg-1); margin: 0.25rem 0 0; }
+.settings-btn {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.45rem 0.75rem;
+  font: inherit;
+  cursor: pointer;
+}
+.settings-btn:hover { border-color: var(--accent); color: var(--accent); }
+.settings-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.settings-caps {
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  font-size: 0.85em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.settings-caps .caps-row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.settings-caps .caps-key {
+  color: var(--fg-1);
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.settings-caps .caps-val {
+  color: var(--fg-0);
+  word-break: break-word;
+}
 .settings-row select {
   background: var(--bg-0);
   color: var(--fg-0);
@@ -213,6 +250,39 @@ body {
 .composer button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.translate-controls {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.4rem 0.6rem 0;
+  flex-wrap: wrap;
+}
+.translate-controls.hidden { display: none; }
+.translate-controls select {
+  flex: 1 1 8rem;
+  min-width: 0;
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.4rem;
+  font: inherit;
+}
+.translate-swap {
+  background: transparent;
+  color: var(--fg-1, var(--fg-0));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.translate-swap:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .upload-btn {
@@ -313,8 +383,110 @@ body {
   50%      { opacity: 0.55; }
 }
 
+/* Thinking state — shown in the assistant message before the first
+   token arrives. Muted to feel "in progress, not yet content". The
+   pulse on the role tag also fires during this state. */
+.thinking {
+  color: var(--fg-1);
+  font-style: italic;
+  letter-spacing: 0.03em;
+}
+.msg.assistant:has(.thinking) .role {
+  animation: lcb-pulse 1.6s ease-in-out infinite;
+}
+
+/* Operation confirm cards — rendered when the chat model emits an
+   op:<name> {…} block or a native tool_call. The user sees a side-by-side
+   prompt enhancement (for image gen) or a parameter dump (for everything
+   else), then hits y/n/e to run, cancel, or edit before running. */
+.op-card {
+  background: var(--bg-1);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.65rem 0.75rem;
+  margin: 0.5rem 0;
+  font-size: 0.9em;
+}
+.op-card .op-card-head {
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 0.4rem;
+  letter-spacing: 0.02em;
+}
+.op-card .op-warn {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--fg-0);
+  border-radius: 4px;
+  padding: 0.4rem 0.55rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+.op-card .op-card-body { display: flex; flex-direction: column; gap: 0.45rem; }
+.op-card .op-row {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 0.5rem;
+  align-items: start;
+}
+.op-card .op-row .op-label {
+  color: var(--fg-1);
+  font-size: 0.85em;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.op-card .op-row .op-value {
+  color: var(--fg-0);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.op-card textarea.op-edit {
+  width: 100%;
+  background: var(--bg-0);
+  color: var(--fg-0);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+  font-size: 0.95em;
+  resize: vertical;
+  min-height: 4em;
+}
+.op-card .op-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.55rem;
+  flex-wrap: wrap;
+}
+.op-card .op-btn {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border: none;
+  padding: 0.3rem 0.85rem;
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+.op-card .op-btn.ghost {
+  background: transparent;
+  color: var(--fg-1);
+  border: 1px solid var(--border);
+}
+.op-card .op-btn.ghost:hover { color: var(--accent); border-color: var(--accent); }
+.op-card .op-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.op-card .op-hint {
+  font-size: 0.78em;
+  color: var(--fg-1);
+  margin-top: 0.3rem;
+}
+.op-card.completed { border-color: var(--border); opacity: 0.85; }
+.op-card.completed .op-actions { display: none; }
+
 @media (max-width: 600px) {
   body { font-size: 13px; }
   .bar select { flex: 1; }
   .upload-btn { padding: 0.25rem 0.5rem; }
+  .op-card .op-row { grid-template-columns: 1fr; gap: 0.15rem; }
 }

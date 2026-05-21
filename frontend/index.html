@@ -43,6 +43,11 @@
     <section id="messages" class="messages" aria-live="polite"></section>
 
     <form id="composer" class="composer">
+      <div id="translate-controls" class="translate-controls hidden">
+        <select id="translate-src" aria-label="Source language"></select>
+        <button id="translate-swap" type="button" class="translate-swap ghost" title="Swap languages" aria-label="Swap source and target">⇄</button>
+        <select id="translate-tgt" aria-label="Target language"></select>
+      </div>
       <textarea id="input" rows="1" placeholder="Ask local inference..." autocomplete="off"></textarea>
       <button id="send" type="submit">send</button>
     </form>
@@ -69,6 +74,25 @@
           <span class="settings-label">Spinner preview</span>
           <span id="settings-spinner-preview" class="spinner-preview"></span>
         </div>
+      </section>
+
+      <section class="settings-section">
+        <h3 class="settings-section-head">Model capabilities</h3>
+        <div id="settings-caps-display" class="settings-caps">
+          <span class="settings-hint">No model selected</span>
+        </div>
+        <button id="settings-reprobe" type="button" class="settings-btn">
+          Re-probe selected model
+        </button>
+        <button id="settings-probe-all" type="button" class="settings-btn">
+          Re-probe all models (wipe cache)
+        </button>
+        <p class="settings-hint">
+          Probes read Ollama's metadata (<code>/api/show</code>) — fast and
+          accurate. Re-probe a single model after <code>ollama pull</code>
+          updates it. Re-probe all to wipe the cache and rebuild from
+          scratch (takes a few seconds for ~26 models).
+        </p>
       </section>
 
       <section class="settings-section">

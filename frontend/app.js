@@ -12,8 +12,37 @@ const input = $("#input");
 const composer = $("#composer");
 const sendBtn = $("#send");
 
-const STORAGE = { theme: "lcb.theme", model: "lcb.model" };
+const STORAGE = {
+  theme: "lcb.theme",
+  model: "lcb.model",
+  translateSrc: "lcb.translate.src",
+  translateTgt: "lcb.translate.tgt",
+};
 const SESSION = "default";  // multi-session support arrives in v1.2
+
+// Subset of TranslateGemma's 55-language coverage, ordered to surface
+// common pairs first. Codes are ISO 639-1; regional variants (e.g. pt-BR,
+// zh-Hans) are accepted by the backend regex if you need them — extend
+// this list to expose them in the dropdown.
+const TRANSLATE_LANGS = [
+  ["en", "English"], ["es", "Spanish"], ["fr", "French"], ["de", "German"],
+  ["it", "Italian"], ["pt", "Portuguese"], ["nl", "Dutch"], ["pl", "Polish"],
+  ["ru", "Russian"], ["uk", "Ukrainian"],
+  ["zh", "Chinese"], ["ja", "Japanese"], ["ko", "Korean"],
+  ["ar", "Arabic"], ["hi", "Hindi"], ["tr", "Turkish"], ["vi", "Vietnamese"],
+  ["id", "Indonesian"], ["th", "Thai"], ["he", "Hebrew"],
+  ["sv", "Swedish"], ["nb", "Norwegian"], ["da", "Danish"], ["fi", "Finnish"],
+  ["cs", "Czech"], ["hu", "Hungarian"], ["ro", "Romanian"], ["el", "Greek"],
+];
+
+// Match only the canonical TranslateGemma base GGUFs (uploaded as
+// hf.co/<user>/translategemma-<size>-it-GGUF:<quant>). The per-pair
+// Modelfiles like `translategemma-4b-en-es` already bake the T3
+// envelope into their TEMPLATE; routing them through /api/operations/
+// translate would double-wrap the envelope and surface raw JSON in
+// the chat bubble. Keep them in the standard chat path instead.
+const isTranslateModel = (name) =>
+  /^hf\.co\/[^\/]+\/translategemma-.+-it-GGUF:/i.test(name || "");
 
 // Spinner registry — frame sets borrowed from indicatif (Rust) and gum (Go).
 // Each entry's interval is tuned for that specific frame set; don't share it.
@@ -55,7 +84,76 @@ function startSpinner(targetEl, label) {
 let history = [];
 let streaming = false;
 let converters = { enabled: [], disabled: [] };
+let operations = { enabled: [], disabled: [], bridges_available: [], output_dir: null };
+let capabilities = {};  // model_name -> {tool_calling, vision, audio, reasoning, ...}
+let probing = false;    // true while a /api/capabilities/probe is in flight
 let pending = null;  // {name, size}
+let pendingOpCard = null;  // active op-card awaiting y/n/e
+let autoRouter = { captioner_model: "" };  // populated from /api/config
+
+// Caption-intent regexes — fire the auto-router when ALL of:
+//   1. a pending file is an image
+//   2. one of these matches the user's prompt
+//   3. captioner_model is configured AND present in the model list
+const CAPTION_INTENT = [
+  /\bdescribe (this|the|that|it)\b/i,
+  /\bwhat'?s in (this|the|that)\b/i,
+  /\bwhat is in (this|the|that)\b/i,
+  /\bwhat does (this|the|that) (image|picture|photo|pic)\b/i,
+  /\b(caption|summari[sz]e) (this|that|it|the|the image|the picture)\b/i,
+  /\btell me about (this|the|that) (image|picture|photo)\b/i,
+  /\bwhat do you see\b/i,
+  /\bidentify (this|the|that|what)\b/i,
+];
+
+const IMAGE_EXT_RE = /\.(png|jpg|jpeg|webp|gif|bmp|tiff?)$/i;
+
+function isImageFile(name) {
+  return !!name && IMAGE_EXT_RE.test(name);
+}
+
+function shouldAutoCaption(prompt) {
+  if (!pending || !isImageFile(pending.name)) return false;
+  if (!autoRouter.captioner_model) return false;
+  // If the user has the captioner itself selected, no point auto-routing.
+  if (modelSel.value === autoRouter.captioner_model) return false;
+  return CAPTION_INTENT.some((re) => re.test(prompt));
+}
+
+// Glyph language for capability display. Single emoji each, mobile-safe.
+// Any change here should also update the README capability matrix.
+const CAP_GLYPHS = {
+  tool_calling_native: "⚒",   // model emits valid tool_calls
+  tool_calling_ignored: "⚙",  // model accepts tools= but ignores them
+  vision: "👁",
+  audio: "🎙",
+  reasoning: "🧠",
+  unknown: "❓",               // not yet probed
+};
+
+function glyphsForModel(name) {
+  const caps = capabilities[name];
+  if (!caps) return CAP_GLYPHS.unknown;
+  const out = [];
+  if (caps.tool_calling === "native") out.push(CAP_GLYPHS.tool_calling_native);
+  else if (caps.tool_calling === "ignored") out.push(CAP_GLYPHS.tool_calling_ignored);
+  if (caps.vision) out.push(CAP_GLYPHS.vision);
+  if (caps.audio) out.push(CAP_GLYPHS.audio);
+  if (caps.reasoning) out.push(CAP_GLYPHS.reasoning);
+  return out.join("") || "·";  // dot if probed but no positive capabilities
+}
+
+function tooltipForModel(name) {
+  const caps = capabilities[name];
+  if (!caps) return "Capabilities not yet probed — will probe on first use";
+  const parts = [];
+  parts.push(`tool calling: ${caps.tool_calling}`);
+  parts.push(`vision: ${caps.vision ? "yes" : "no"}`);
+  parts.push(`audio: ${caps.audio ? "yes" : "no"}`);
+  parts.push(`reasoning: ${caps.reasoning ? "yes" : "no"}`);
+  if (caps.last_probed) parts.push(`last probed: ${caps.last_probed}`);
+  return parts.join("\n");
+}
 
 function makeOption(value, label = value) {
   const opt = document.createElement("option");
@@ -64,42 +162,96 @@ function makeOption(value, label = value) {
   return opt;
 }
 
+// Bootstrap: every optional fetch is wrapped so a failure can't take
+// down the critical path (model dropdown). Themes, converters, and
+// operations are nice-to-have at startup; chat-with-a-model is the
+// product. Always load model dropdown FIRST.
+async function safeJSON(url, fallback) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch (e) {
+    appendMsg("error", `${url} failed: ${e.message}`);
+    return fallback;
+  }
+}
+
 async function bootstrap() {
-  const cfg = await fetch("/api/config").then((r) => r.json());
+  // Capabilities cache loaded BEFORE the dropdown so glyphs are available
+  // for the first render. If it 404s/errs, glyphs gracefully show ❓.
+  capabilities = await safeJSON("/api/capabilities", {});
+
+  // 1. Critical: model dropdown. Load this first so a backend hiccup
+  // elsewhere can't leave it spinning forever.
+  modelSel.replaceChildren();
+  try {
+    const r = await fetch("/api/models");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const models = await r.json();
+    if (!models.length) {
+      appendMsg("error", "Ollama is up but no models are installed. Run `ollama pull <name>`.");
+    } else {
+      modelSel.replaceChildren(...models.map((m) => makeModelOption(m)));
+      const savedModel = localStorage.getItem(STORAGE.model);
+      if (savedModel && models.includes(savedModel)) modelSel.value = savedModel;
+    }
+  } catch (e) {
+    appendMsg("error", `Could not list models: ${e.message}`);
+    modelSel.replaceChildren(makeOption("", "(no models)"));
+  }
+
+  // 2. Optional: config + themes.
+  const cfg = await safeJSON("/api/config", { system_prompt: "", default_theme: "tokyo-night", auto_router: {} });
   history = [{ role: "system", content: cfg.system_prompt }];
+  autoRouter = cfg.auto_router || { captioner_model: "" };
 
-  const themes = await fetch("/api/themes").then((r) => r.json());
-  themeSel.replaceChildren(...themes.map((t) => makeOption(t)));
-  const savedTheme = localStorage.getItem(STORAGE.theme) || cfg.default_theme;
-  setTheme(themes.includes(savedTheme) ? savedTheme : themes[0]);
-  themeSel.value = document.documentElement.dataset.theme;
+  const themes = await safeJSON("/api/themes", []);
+  if (themes.length) {
+    themeSel.replaceChildren(...themes.map((t) => makeOption(t)));
+    const savedTheme = localStorage.getItem(STORAGE.theme) || cfg.default_theme;
+    setTheme(themes.includes(savedTheme) ? savedTheme : themes[0]);
+    themeSel.value = document.documentElement.dataset.theme;
+  }
 
-  converters = await fetch("/api/converters").then((r) => r.json());
+  // 3. Optional: converters + operations.
+  converters = await safeJSON("/api/converters", { enabled: [], disabled: [] });
   if (converters.disabled.length) {
     appendMsg(
       "system",
       `${converters.enabled.length} converters enabled, ${converters.disabled.length} skipped (missing: ${converters.disabled.map((d) => d.missing).join(", ")})`,
     );
-  } else {
+  } else if (converters.enabled.length) {
     appendMsg("system", `${converters.enabled.length} converters ready`);
   }
 
-  modelSel.replaceChildren();
-  try {
-    const models = await fetch("/api/models").then((r) => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    });
-    if (!models.length) {
-      appendMsg("error", "Ollama is up but no models are installed. Run `ollama pull <name>`.");
-      return;
-    }
-    modelSel.replaceChildren(...models.map((m) => makeOption(m)));
-    const savedModel = localStorage.getItem(STORAGE.model);
-    if (savedModel && models.includes(savedModel)) modelSel.value = savedModel;
-  } catch (e) {
-    appendMsg("error", `Could not list models: ${e.message}`);
+  operations = await safeJSON("/api/operations", { enabled: [], disabled: [], bridges_available: [], output_dir: null });
+  if (operations.enabled.length) {
+    const bridges = operations.bridges_available.length
+      ? ` (bridges: ${operations.bridges_available.join(", ")})`
+      : "";
+    appendMsg("system", `${operations.enabled.length} operations available${bridges}`);
   }
+  if (operations.disabled.length) {
+    appendMsg(
+      "system",
+      `${operations.disabled.length} operation(s) disabled: ${operations.disabled.map((d) => `${d.id} (${d.reason})`).join("; ")}`,
+    );
+  }
+  if (operations.output_dir) {
+    appendMsg("system", `output mirror: ${operations.output_dir}`);
+  }
+
+  // Restored or default-selected model may need its first probe.
+  if (modelSel.value && !capabilities[modelSel.value]) {
+    probeModelIfNeeded(modelSel.value);  // fire-and-forget, doesn't block bootstrap
+  }
+
+  // Set initial composer mode based on the restored model. Must run
+  // after populateTranslateLangs() so the dropdowns have options when
+  // the placeholder is composed.
+  populateTranslateLangs();
+  updateComposerMode();
 }
 
 function setTheme(name) {
@@ -109,7 +261,114 @@ function setTheme(name) {
 }
 
 themeSel.addEventListener("change", () => setTheme(themeSel.value));
-modelSel.addEventListener("change", () => localStorage.setItem(STORAGE.model, modelSel.value));
+
+function makeModelOption(name) {
+  const opt = document.createElement("option");
+  opt.value = name;
+  opt.textContent = `${name} ${glyphsForModel(name)}`;
+  opt.title = tooltipForModel(name);
+  return opt;
+}
+
+function refreshModelDropdown() {
+  const current = modelSel.value;
+  const opts = [...modelSel.options].map((o) => o.value);
+  modelSel.replaceChildren(...opts.map((m) => makeModelOption(m)));
+  if (current && opts.includes(current)) modelSel.value = current;
+}
+
+async function probeModelIfNeeded(model) {
+  if (!model || capabilities[model] || probing) return;
+  probing = true;
+  const status = appendMsg("system", "");
+  const stopSpin = startSpinner(status, `first-run capability probe: ${model} (~30-180s)...`);
+  try {
+    const r = await fetch("/api/capabilities/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const caps = await r.json();
+    capabilities[model] = caps;
+    refreshModelDropdown();
+    stopSpin();
+    status.parentElement.remove();
+    const summary = [];
+    if (caps.tool_calling === "native") summary.push(`tools ${CAP_GLYPHS.tool_calling_native}`);
+    else if (caps.tool_calling === "ignored") summary.push(`tools accepted but ignored ${CAP_GLYPHS.tool_calling_ignored}`);
+    else if (caps.tool_calling === "rejected") summary.push("tools rejected");
+    else summary.push(`tools ${caps.tool_calling}`);
+    if (caps.vision) summary.push(`vision ${CAP_GLYPHS.vision}`);
+    if (caps.reasoning) summary.push(`reasoning ${CAP_GLYPHS.reasoning}`);
+    appendMsg("system", `${model}: ${summary.join(" · ")}`);
+  } catch (e) {
+    stopSpin();
+    status.textContent = ` capability probe failed: ${e.message}`;
+    status.parentElement.classList.add("error");
+  } finally {
+    probing = false;
+  }
+}
+
+modelSel.addEventListener("change", async () => {
+  localStorage.setItem(STORAGE.model, modelSel.value);
+  updateComposerMode();
+  await probeModelIfNeeded(modelSel.value);
+});
+
+// ─── translate composer mode ───────────────────────────────────────
+// Composer swaps between chat-input and translate-input based on the
+// selected model. Translate mode shows src/tgt selects above the
+// textarea and routes submit to /api/operations/translate, which
+// builds the TranslateGemma T3 envelope server-side. Chat mode is the
+// default for everything else.
+
+const translateControls = $("#translate-controls");
+const translateSrcSel = $("#translate-src");
+const translateTgtSel = $("#translate-tgt");
+const translateSwapBtn = $("#translate-swap");
+
+function populateTranslateLangs() {
+  const buildOptions = () =>
+    TRANSLATE_LANGS.map(([code, label]) => {
+      const o = document.createElement("option");
+      o.value = code;
+      o.textContent = `${label} (${code})`;
+      return o;
+    });
+  translateSrcSel.replaceChildren(...buildOptions());
+  translateTgtSel.replaceChildren(...buildOptions());
+  translateSrcSel.value = localStorage.getItem(STORAGE.translateSrc) || "en";
+  translateTgtSel.value = localStorage.getItem(STORAGE.translateTgt) || "es";
+
+  translateSrcSel.addEventListener("change", () => {
+    localStorage.setItem(STORAGE.translateSrc, translateSrcSel.value);
+    updateComposerMode();  // refresh placeholder
+  });
+  translateTgtSel.addEventListener("change", () => {
+    localStorage.setItem(STORAGE.translateTgt, translateTgtSel.value);
+    updateComposerMode();
+  });
+  translateSwapBtn.addEventListener("click", () => {
+    const s = translateSrcSel.value;
+    translateSrcSel.value = translateTgtSel.value;
+    translateTgtSel.value = s;
+    localStorage.setItem(STORAGE.translateSrc, translateSrcSel.value);
+    localStorage.setItem(STORAGE.translateTgt, translateTgtSel.value);
+    updateComposerMode();
+  });
+}
+
+function updateComposerMode() {
+  const translateMode = isTranslateModel(modelSel.value);
+  translateControls.classList.toggle("hidden", !translateMode);
+  if (translateMode) {
+    input.placeholder = `Text to translate (${translateSrcSel.value} → ${translateTgtSel.value})...`;
+  } else {
+    input.placeholder = "Ask local inference...";
+  }
+}
 
 // ─── messages ──────────────────────────────────────────────────────
 
@@ -128,6 +387,33 @@ function appendMsg(role, text) {
   return c;
 }
 
+// iOS standalone PWA: tapping <a download> opens an embedded QuickLook preview
+// with no back button — swipe-kill is the only escape. Route through the share
+// sheet instead, which has a Cancel button and returns to the PWA cleanly.
+const IS_IOS_PWA = window.navigator.standalone === true;
+
+async function shareInsteadOfDownload(e, href, name) {
+  e.preventDefault();
+  try {
+    const res = await fetch(href);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const file = new File([blob], name, {
+      type: blob.type || "application/octet-stream",
+    });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      return;
+    }
+    // Web Share Level 2 unavailable on this iOS — open in mobile Safari,
+    // which at least gives the user a Done button to return.
+    window.open(href, "_blank");
+  } catch (err) {
+    if (err.name === "AbortError") return; // user tapped Cancel on share sheet
+    appendMsg("error", `share failed: ${err.message}`);
+  }
+}
+
 function appendDownload(role, prefix, name, href) {
   const wrap = document.createElement("div");
   wrap.className = `msg ${role}`;
@@ -142,6 +428,9 @@ function appendDownload(role, prefix, name, href) {
   a.href = href;
   a.textContent = name;
   a.setAttribute("download", name);
+  if (IS_IOS_PWA) {
+    a.addEventListener("click", (e) => shareInsteadOfDownload(e, href, name));
+  }
   c.appendChild(a);
   wrap.append(r, c);
   messagesEl.appendChild(wrap);
@@ -279,6 +568,13 @@ fileInput.addEventListener("change", async () => {
       meta.name,
       `/api/files/${SESSION}/${encodeURIComponent(meta.name)}`,
     );
+    // Inject into chat history so the model knows the file exists and
+    // can reference it by name in operation calls. Without this, the
+    // model's context contains zero indication that a file was uploaded.
+    history.push({
+      role: "system",
+      content: `User uploaded file "${meta.name}" (${formatBytes(meta.size)}) — available in the workspace as "${meta.name}". When the user asks you to process, convert, edit, or modify this file, use one of the available operations with "${meta.name}" as the source.`,
+    });
     showTray(meta);
   } catch (e) {
     stopSpinner();
@@ -326,6 +622,325 @@ trayConvert.addEventListener("click", async () => {
   }
 });
 
+// ─── operations: parse model output, render confirm card, run on Y ────
+
+// Match a fenced ```op:<id>\n{json}\n``` block. Tolerant of trailing
+// whitespace and of the model forgetting the closing fence.
+const OP_FENCE_RE = /```op:([a-zA-Z0-9_]+)\s*\n([\s\S]*?)(?:```|$)/g;
+
+function findOperation(opId) {
+  return operations.enabled.find((op) => op.id === opId) || null;
+}
+
+function parseOpFromText(text) {
+  const out = [];
+  for (const match of text.matchAll(OP_FENCE_RE)) {
+    const [, opId, body] = match;
+    let params;
+    try {
+      params = JSON.parse(body.trim());
+    } catch {
+      continue;  // skip malformed blocks, the model can retry
+    }
+    out.push({ operation: opId, params });
+  }
+  return out;
+}
+
+function parseToolCallSentinel(text) {
+  // Backend emits a one-line JSON sentinel `{"__tool_calls__": [...]}` for
+  // native Ollama tool_calls. Find it, strip it from displayed text.
+  const idx = text.lastIndexOf('{"__tool_calls__"');
+  if (idx < 0) return { calls: [], cleanedText: text };
+  const tail = text.slice(idx);
+  const newline = tail.indexOf("\n");
+  const jsonLine = newline === -1 ? tail : tail.slice(0, newline);
+  try {
+    const parsed = JSON.parse(jsonLine);
+    const calls = (parsed.__tool_calls__ || []).map((tc) => ({
+      operation: tc.function?.name,
+      params: tc.function?.arguments || {},
+    }));
+    return { calls, cleanedText: text.slice(0, idx).trimEnd() };
+  } catch {
+    return { calls: [], cleanedText: text };
+  }
+}
+
+async function maybeEnhancePrompt(op, params) {
+  if (!op.enhance) return null;
+  const userPrompt = String(params.prompt || "").trim();
+  if (!userPrompt) return null;
+  try {
+    const r = await fetch("/api/operations/enhance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: userPrompt,
+        chat_model: modelSel.value,
+        image_model: params.model || "",
+        mode: params.mode || "auto",
+      }),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+// Returns a list of capability keys the current model lacks for this op.
+// "text" is universal (every chat model satisfies it) and skipped.
+function missingCapabilities(opMeta) {
+  const required = opMeta?.capabilities_required || ["text"];
+  const caps = capabilities[modelSel.value] || {};
+  const missing = [];
+  for (const need of required) {
+    if (need === "text") continue;
+    if (need === "tool_calling" && caps.tool_calling === "native") continue;
+    if (need === "vision" && caps.vision) continue;
+    if (need === "audio" && caps.audio) continue;
+    if (need === "reasoning" && caps.reasoning) continue;
+    missing.push(need);
+  }
+  return missing;
+}
+
+// Returns the list of model names that DO satisfy every required cap.
+function modelsSatisfying(required) {
+  const out = [];
+  for (const [name, caps] of Object.entries(capabilities)) {
+    let ok = true;
+    for (const need of required) {
+      if (need === "text") continue;
+      if (need === "tool_calling" && caps.tool_calling !== "native") { ok = false; break; }
+      if (need === "vision" && !caps.vision) { ok = false; break; }
+      if (need === "audio" && !caps.audio) { ok = false; break; }
+      if (need === "reasoning" && !caps.reasoning) { ok = false; break; }
+    }
+    if (ok) out.push(name);
+  }
+  return out;
+}
+
+function buildOpCard(call, opMeta, enhanced) {
+  const card = document.createElement("div");
+  card.className = "op-card";
+
+  const head = document.createElement("div");
+  head.className = "op-card-head";
+  head.textContent = `operation> ${call.operation}`;
+  card.appendChild(head);
+
+  // Capability warn banner — warn-and-allow per fork B. The user can
+  // still hit Y; the warning is informational. Suggests other models
+  // that DO satisfy the requirement.
+  const missing = missingCapabilities(opMeta);
+  if (missing.length) {
+    const warn = document.createElement("div");
+    warn.className = "op-warn";
+    const candidates = modelsSatisfying(opMeta.capabilities_required || []);
+    const pick = candidates.filter((n) => n !== modelSel.value).slice(0, 3);
+    const suggest = pick.length
+      ? ` Models that have it: ${pick.join(", ")}.`
+      : " No probed model in your dropdown satisfies this — you'll need to switch models or add capability via vLLM.";
+    warn.textContent = `⚠ ${modelSel.value} doesn't have: ${missing.join(", ")}.${suggest} Y still runs.`;
+    card.appendChild(warn);
+  }
+
+  const body = document.createElement("div");
+  body.className = "op-card-body";
+  card.appendChild(body);
+
+  const editable = {};  // name → element with .value
+
+  function row(label, value, editKey = null) {
+    const r = document.createElement("div");
+    r.className = "op-row";
+    const l = document.createElement("span");
+    l.className = "op-label";
+    l.textContent = label;
+    r.appendChild(l);
+    if (editKey) {
+      const ta = document.createElement("textarea");
+      ta.className = "op-edit";
+      ta.value = value || "";
+      ta.rows = Math.min(6, Math.max(2, String(value || "").split("\n").length + 1));
+      r.appendChild(ta);
+      editable[editKey] = ta;
+    } else {
+      const v = document.createElement("span");
+      v.className = "op-value";
+      v.textContent = value;
+      r.appendChild(v);
+    }
+    body.appendChild(r);
+  }
+
+  if (enhanced && enhanced.mode !== "passthrough") {
+    row("original", enhanced.original_prompt);
+    row("enhanced", enhanced.enhanced_prompt, "prompt");
+    row("negative", enhanced.negative_prompt, "negative_prompt");
+    if (enhanced.changes) row("changes", enhanced.changes);
+    row("mode", enhanced.mode);
+  } else if (call.params.prompt !== undefined) {
+    row("prompt", String(call.params.prompt || ""), "prompt");
+    if (call.params.negative_prompt !== undefined) {
+      row("negative", String(call.params.negative_prompt || ""), "negative_prompt");
+    }
+  }
+
+  // Show every other param for transparency, non-editable.
+  for (const [name, value] of Object.entries(call.params)) {
+    if (["prompt", "negative_prompt", "mode"].includes(name)) continue;
+    row(name, String(value));
+  }
+  if (opMeta?.source_param && pending?.name) {
+    row("source", pending.name);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "op-actions";
+  const yes = document.createElement("button");
+  yes.type = "button";
+  yes.className = "op-btn";
+  yes.textContent = "[y] run";
+  const no = document.createElement("button");
+  no.type = "button";
+  no.className = "op-btn ghost";
+  no.textContent = "[n] cancel";
+  actions.append(yes, no);
+  card.appendChild(actions);
+
+  const hint = document.createElement("div");
+  hint.className = "op-hint";
+  hint.textContent = "y to run · n to cancel · edit fields above first if needed";
+  card.appendChild(hint);
+
+  return { card, yes, no, editable };
+}
+
+async function presentOpConfirm(call) {
+  const opMeta = findOperation(call.operation);
+  if (!opMeta) {
+    appendMsg("error", `model requested unknown operation '${call.operation}'`);
+    return;
+  }
+
+  const status = appendMsg("system", "");
+  const stopSpin = startSpinner(status, `preparing ${call.operation}...`);
+  let enhanced = null;
+  try {
+    enhanced = await maybeEnhancePrompt(opMeta, call.params);
+  } finally {
+    stopSpin();
+    status.parentElement.remove();
+  }
+
+  const { card, yes, no, editable } = buildOpCard(call, opMeta, enhanced);
+  const wrap = document.createElement("div");
+  wrap.className = "msg system";
+  const role = document.createElement("span");
+  role.className = "role";
+  role.textContent = "operation>";
+  const content = document.createElement("span");
+  content.className = "content";
+  content.appendChild(card);
+  wrap.append(role, content);
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  pendingOpCard = { card, yes, no, editable, call, opMeta, enhanced, wrap };
+
+  const onYes = () => runConfirmedOp();
+  const onNo = () => cancelConfirmedOp();
+  yes.addEventListener("click", onYes);
+  no.addEventListener("click", onNo);
+}
+
+async function runConfirmedOp() {
+  if (!pendingOpCard) return;
+  const { card, yes, no, editable, call, opMeta, enhanced, wrap } = pendingOpCard;
+  pendingOpCard = null;
+  yes.disabled = true; no.disabled = true;
+
+  // Merge edits back into params.
+  const finalParams = { ...call.params };
+  for (const [k, el] of Object.entries(editable)) {
+    finalParams[k] = el.value.trim();
+  }
+  // If we ran an enhance, the negative prompt should also flow through.
+  if (enhanced && enhanced.mode !== "passthrough") {
+    if (editable.prompt) finalParams.prompt = editable.prompt.value.trim();
+    if (editable.negative_prompt) finalParams.negative_prompt = editable.negative_prompt.value.trim();
+  }
+
+  const placeholder = document.createElement("div");
+  placeholder.className = "op-hint";
+  card.appendChild(placeholder);
+  const stopSpin = startSpinner(placeholder, `running ${call.operation}...`);
+
+  const body = {
+    operation: call.operation,
+    session_id: SESSION,
+    params: finalParams,
+  };
+  if (opMeta.source_param && pending?.name) {
+    body.source = pending.name;
+  }
+
+  try {
+    const r = await fetch("/api/operations/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    stopSpin();
+    placeholder.remove();
+    card.classList.add("completed");
+    appendDownload(
+      "system",
+      `${data.via} produced ${formatBytes(data.size)}${data.mirror ? ` (mirrored: ${data.mirror})` : ""}:`,
+      data.name,
+      data.url || `/api/files/${SESSION}/${encodeURIComponent(data.name)}`,
+    );
+    // Feed the result back into chat history so the model can reference it.
+    history.push({
+      role: "assistant",
+      content: `[operation ${data.via} produced ${data.name}]`,
+    });
+  } catch (e) {
+    stopSpin();
+    placeholder.textContent = ` operation failed: ${e.message}`;
+    wrap.classList.add("error");
+  }
+}
+
+function cancelConfirmedOp() {
+  if (!pendingOpCard) return;
+  const { card, yes, no } = pendingOpCard;
+  yes.disabled = true; no.disabled = true;
+  card.classList.add("completed");
+  appendMsg("system", `cancelled — operation not run`);
+  pendingOpCard = null;
+}
+
+document.addEventListener("keydown", (e) => {
+  // y/n/e shortcuts only fire when a card is awaiting and the user isn't
+  // typing in the composer (so 'y' inside a prompt doesn't fire-and-forget).
+  if (!pendingOpCard) return;
+  if (document.activeElement && ["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName)) return;
+  if (e.key === "y" || e.key === "Y") { e.preventDefault(); runConfirmedOp(); }
+  else if (e.key === "n" || e.key === "N") { e.preventDefault(); cancelConfirmedOp(); }
+  else if (e.key === "e" || e.key === "E") {
+    e.preventDefault();
+    const first = pendingOpCard.editable.prompt || Object.values(pendingOpCard.editable)[0];
+    if (first) first.focus();
+  }
+});
+
 // ─── chat ──────────────────────────────────────────────────────────
 
 async function send() {
@@ -339,11 +954,64 @@ async function send() {
   input.value = "";
   autosize();
 
+  // Translate mode: routed when the active model is a TranslateGemma
+  // tag. We don't push to chat history — each translation is fresh —
+  // but the user's input still appears in the messages stream so they
+  // can see what was asked.
+  if (isTranslateModel(modelSel.value)) {
+    const src = translateSrcSel.value;
+    const tgt = translateTgtSel.value;
+    appendMsg("user", text);
+    appendMsg("system", `→ ${src} → ${tgt}`);
+    return translateSend(text, src, tgt);
+  }
+
+  // Auto-router: caption intent + uploaded image + captioner present →
+  // bypass the selected chat model and route directly to the captioner.
+  // The user sees a clear notification; falls through to normal chat
+  // on any error so the request never silently fails.
+  if (shouldAutoCaption(text)) {
+    history.push({ role: "user", content: text });
+    appendMsg("user", text);
+    appendMsg(
+      "system",
+      `→ auto-routing to captioner (${autoRouter.captioner_model}) — specialised for image description, faster than ${modelSel.value} for this`,
+    );
+    return autoCaptionSend(text);
+  }
+
   history.push({ role: "user", content: text });
   appendMsg("user", text);
   const out = appendMsg("assistant", "");
-  out.classList.add("streaming");
   out.parentElement.classList.add("streaming");
+
+  // "Thinking" indicator — Claude-Code-style spinner + label + elapsed
+  // timer that fills the dead-air gap before the first token arrives.
+  // Auto-cancels when the first chunk lands; the blinking cursor takes
+  // over from there. Spinner frames + interval inherit from settings.
+  const thinkCfg = SPINNERS[settings.spinner] || SPINNERS.braille;
+  const thinkStart = Date.now();
+  let thinkFrame = 0;
+  let thinking = true;
+  out.classList.add("thinking");
+  // Initial paint as fallback even if the spinner interval is somehow
+  // suppressed (e.g. by a backgrounded tab throttling timers): the user
+  // always sees at minimum a static "thinking · 0s" the moment they hit send.
+  out.textContent = ` ${thinkCfg.frames[0]} thinking · 0s`;
+  const renderThinking = () => {
+    if (!thinking) return;
+    const elapsed = Math.floor((Date.now() - thinkStart) / 1000);
+    out.textContent = ` ${thinkCfg.frames[thinkFrame]} thinking · ${elapsed}s`;
+    thinkFrame = (thinkFrame + 1) % thinkCfg.frames.length;
+  };
+  const thinkInterval = setInterval(renderThinking, thinkCfg.interval);
+  const stopThinking = () => {
+    if (!thinking) return;
+    thinking = false;
+    clearInterval(thinkInterval);
+    out.classList.remove("thinking");
+    out.classList.add("streaming");
+  };
 
   streaming = true;
   sendBtn.disabled = true;
@@ -362,14 +1030,184 @@ async function send() {
       const { value, done } = await reader.read();
       if (done) break;
       acc += dec.decode(value, { stream: true });
+      if (thinking) stopThinking();  // first chunk wins
+      out.textContent = ` ${acc}`;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // Strip the native-tool-call sentinel out of the displayed text and
+    // collect both kinds of operation invocations.
+    const { calls: toolCalls, cleanedText } = parseToolCallSentinel(acc);
+    // Strip op fences from displayed text too — they're already shown as
+    // confirm cards below, so leaving them as raw JSON in the assistant
+    // line is just noise.
+    const opCalls = parseOpFromText(cleanedText);
+    const allCalls = [...toolCalls, ...opCalls];
+    const textWithoutFences = cleanedText.replace(OP_FENCE_RE, "").trim();
+
+    // Pure-tool-caller path: model emitted only structured calls, no prose.
+    // Replace the blank line with a one-line summary so the user knows
+    // *something* happened. The card below has the detail.
+    let displayedText = textWithoutFences;
+    if (!displayedText && allCalls.length) {
+      const ids = allCalls.map((c) => c.operation).filter(Boolean);
+      displayedText = `→ requested ${ids.length > 1 ? "operations" : "operation"}: ${ids.join(", ")}`;
+    } else if (!displayedText && !allCalls.length) {
+      displayedText = "[empty response]";
+    }
+    out.textContent = ` ${displayedText}`;
+    history.push({ role: "assistant", content: displayedText });
+
+    // One card at a time — y/n/e handler operates on a single pending card.
+    // If the model emits multiple, queue them sequentially.
+    for (const call of allCalls) {
+      if (call.operation) await presentOpConfirm(call);
+    }
+  } catch (e) {
+    stopThinking();
+    out.textContent = ` [error: ${e.message}]`;
+    out.parentElement.classList.add("error");
+  } finally {
+    stopThinking();  // idempotent — covers stream-completed-with-no-chunks edge
+    out.classList.remove("streaming");
+    out.parentElement.classList.remove("streaming");
+    streaming = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+async function autoCaptionSend(text) {
+  const out = appendMsg("assistant", "");
+  out.parentElement.classList.add("streaming");
+
+  // Reuse the thinking spinner — captioner model load is the main wait.
+  const thinkCfg = SPINNERS[settings.spinner] || SPINNERS.braille;
+  const thinkStart = Date.now();
+  let thinkFrame = 0;
+  let thinking = true;
+  out.classList.add("thinking");
+  out.textContent = ` ${thinkCfg.frames[0]} captioning · 0s`;
+  const renderThinking = () => {
+    if (!thinking) return;
+    const elapsed = Math.floor((Date.now() - thinkStart) / 1000);
+    out.textContent = ` ${thinkCfg.frames[thinkFrame]} captioning · ${elapsed}s`;
+    thinkFrame = (thinkFrame + 1) % thinkCfg.frames.length;
+  };
+  const thinkInterval = setInterval(renderThinking, thinkCfg.interval);
+  const stopThinking = () => {
+    if (!thinking) return;
+    thinking = false;
+    clearInterval(thinkInterval);
+    out.classList.remove("thinking");
+    out.classList.add("streaming");
+  };
+
+  streaming = true;
+  sendBtn.disabled = true;
+
+  let acc = "";
+  try {
+    const r = await fetch("/api/auto-caption", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: SESSION,
+        source: pending.name,
+        prompt: text,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`HTTP ${r.status}: ${err.slice(0, 200)}`);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      acc += dec.decode(value, { stream: true });
+      if (thinking) stopThinking();
       out.textContent = ` ${acc}`;
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
     history.push({ role: "assistant", content: acc });
   } catch (e) {
-    out.textContent = ` [error: ${e.message}]`;
+    stopThinking();
+    out.textContent = ` [auto-caption failed: ${e.message}]`;
     out.parentElement.classList.add("error");
   } finally {
+    stopThinking();
+    out.classList.remove("streaming");
+    out.parentElement.classList.remove("streaming");
+    streaming = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+async function translateSend(text, sourceLang, targetLang) {
+  const out = appendMsg("assistant", "");
+  out.parentElement.classList.add("streaming");
+
+  // Reuse the thinking-spinner pattern — first translation on a
+  // cold-loaded 27 B is the slow case, subsequent ones are sub-second.
+  const thinkCfg = SPINNERS[settings.spinner] || SPINNERS.braille;
+  const thinkStart = Date.now();
+  let thinkFrame = 0;
+  let thinking = true;
+  out.classList.add("thinking");
+  out.textContent = ` ${thinkCfg.frames[0]} translating · 0s`;
+  const renderThinking = () => {
+    if (!thinking) return;
+    const elapsed = Math.floor((Date.now() - thinkStart) / 1000);
+    out.textContent = ` ${thinkCfg.frames[thinkFrame]} translating · ${elapsed}s`;
+    thinkFrame = (thinkFrame + 1) % thinkCfg.frames.length;
+  };
+  const thinkInterval = setInterval(renderThinking, thinkCfg.interval);
+  const stopThinking = () => {
+    if (!thinking) return;
+    thinking = false;
+    clearInterval(thinkInterval);
+    out.classList.remove("thinking");
+    out.classList.add("streaming");
+  };
+
+  streaming = true;
+  sendBtn.disabled = true;
+
+  let acc = "";
+  try {
+    const r = await fetch("/api/operations/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelSel.value,
+        source_lang: sourceLang,
+        target_lang: targetLang,
+        text,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(`HTTP ${r.status}: ${err.slice(0, 200)}`);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      acc += dec.decode(value, { stream: true });
+      if (thinking) stopThinking();
+      out.textContent = ` ${acc}`;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  } catch (e) {
+    stopThinking();
+    out.textContent = ` [translate failed: ${e.message}]`;
+    out.parentElement.classList.add("error");
+  } finally {
+    stopThinking();
     out.classList.remove("streaming");
     out.parentElement.classList.remove("streaming");
     streaming = false;
@@ -416,6 +1254,7 @@ function openSettings() {
   settingsSpinnerSel.replaceChildren(...Object.keys(SPINNERS).map((k) => makeOption(k)));
   settingsSpinnerSel.value = settings.spinner;
   startPreview();
+  renderCapsDisplay();
   settingsPanel.classList.remove("hidden");
   settingsBackdrop.classList.remove("hidden");
 }
@@ -437,6 +1276,94 @@ settingsSpinnerSel.addEventListener("change", () => {
   saveSettings();
   startPreview();
 });
+
+// ─── settings: capability re-probe ────────────────────────────────
+
+const capsDisplay = document.getElementById("settings-caps-display");
+const reprobeBtn = document.getElementById("settings-reprobe");
+
+function renderCapsDisplay() {
+  const model = modelSel.value;
+  capsDisplay.replaceChildren();
+  if (!model) {
+    const hint = document.createElement("span");
+    hint.className = "settings-hint";
+    hint.textContent = "No model selected";
+    capsDisplay.appendChild(hint);
+    return;
+  }
+  const caps = capabilities[model];
+  if (!caps) {
+    const hint = document.createElement("span");
+    hint.className = "settings-hint";
+    hint.textContent = `${model} — not yet probed`;
+    capsDisplay.appendChild(hint);
+    return;
+  }
+  const rows = [
+    ["model", model],
+    ["tool calling", String(caps.tool_calling)],
+    ["vision", caps.vision ? "yes" : "no"],
+    ["audio", caps.audio ? "yes" : "no"],
+    ["reasoning", caps.reasoning ? "yes" : "no"],
+    ["last probed", caps.last_probed || "—"],
+    ["probe count", String(caps.probe_count ?? 1)],
+  ];
+  for (const [k, v] of rows) {
+    const row = document.createElement("div");
+    row.className = "caps-row";
+    const key = document.createElement("span");
+    key.className = "caps-key";
+    key.textContent = k;
+    const val = document.createElement("span");
+    val.className = "caps-val";
+    val.textContent = v;
+    row.append(key, val);
+    capsDisplay.appendChild(row);
+  }
+}
+
+reprobeBtn.addEventListener("click", async () => {
+  const model = modelSel.value;
+  if (!model || probing) return;
+  reprobeBtn.disabled = true;
+  reprobeBtn.textContent = "probing...";
+  delete capabilities[model];
+  refreshModelDropdown();
+  await probeModelIfNeeded(model);
+  renderCapsDisplay();
+  reprobeBtn.disabled = false;
+  reprobeBtn.textContent = "Re-probe selected model";
+});
+
+const probeAllBtn = document.getElementById("settings-probe-all");
+probeAllBtn.addEventListener("click", async () => {
+  if (probing) return;
+  if (!confirm("Wipe the capability cache and re-probe all installed Ollama models? Takes a few seconds.")) return;
+  probeAllBtn.disabled = true;
+  probeAllBtn.textContent = "probing all...";
+  const status = appendMsg("system", "");
+  const stopSpin = startSpinner(status, "re-probing all models via /api/show metadata...");
+  try {
+    const r = await fetch("/api/capabilities/probe-all", { method: "POST" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    capabilities = await r.json();
+    refreshModelDropdown();
+    renderCapsDisplay();
+    stopSpin();
+    status.parentElement.remove();
+    appendMsg("system", `re-probed ${Object.keys(capabilities).length} models`);
+  } catch (e) {
+    stopSpin();
+    status.textContent = ` probe-all failed: ${e.message}`;
+    status.parentElement.classList.add("error");
+  } finally {
+    probeAllBtn.disabled = false;
+    probeAllBtn.textContent = "Re-probe all models (wipe cache)";
+  }
+});
+
+modelSel.addEventListener("change", renderCapsDisplay);
 
 document.getElementById("settings-reset").addEventListener("click", () => {
   if (!confirm("Reset all settings (theme, spinner, model preference) to defaults? Workspace files are not affected.")) return;
