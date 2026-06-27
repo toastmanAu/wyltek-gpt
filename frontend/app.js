@@ -61,7 +61,7 @@ const SPINNERS = {
 };
 
 const SETTINGS_KEY = "lcb.settings";
-const DEFAULT_SETTINGS = { spinner: "braille" };
+const DEFAULT_SETTINGS = { spinner: "braille", collapseReasoning: false };
 let settings = { ...DEFAULT_SETTINGS, ...safeParse(localStorage.getItem(SETTINGS_KEY)) };
 
 function safeParse(s) {
@@ -685,6 +685,62 @@ function parseStatsSentinel(text) {
   }
 }
 
+// ─── reasoning (thinking) channel ──────────────────────────────────
+// Reasoning models (GLM-4.7-flash, qwen3.6) stream their chain-of-thought
+// on a separate Ollama `thinking` field. The backend splices that run into
+// the text stream bracketed by THINK_OPEN/THINK_CLOSE sentinels (two \x01
+// control chars + tag) so we can render it in a distinct, collapsible block
+// — and still scan it for code blocks, since some models (GLM-4.7-flash)
+// emit the actual artifact inside their reasoning rather than the answer.
+const _THINK_SENTINEL = String.fromCharCode(1, 1);
+const THINK_OPEN = `${_THINK_SENTINEL}THINK${_THINK_SENTINEL}`;
+const THINK_CLOSE = `${_THINK_SENTINEL}/THINK${_THINK_SENTINEL}`;
+
+// Split a streamed assistant string into { thinking, content }. Handles the
+// common single-block case (reasoning first, then answer) and the still-
+// streaming case where THINK_CLOSE hasn't landed yet.
+function splitThinking(text) {
+  const open = text.indexOf(THINK_OPEN);
+  if (open === -1) return { thinking: "", content: text };
+  const afterOpen = open + THINK_OPEN.length;
+  const close = text.indexOf(THINK_CLOSE, afterOpen);
+  if (close === -1) {
+    // Reasoning still streaming — everything past the marker is thinking.
+    return { thinking: text.slice(afterOpen), content: text.slice(0, open) };
+  }
+  const thinking = text.slice(afterOpen, close);
+  const content = text.slice(0, open) + text.slice(close + THINK_CLOSE.length);
+  return { thinking, content };
+}
+
+// Lazily create (once) the collapsible reasoning block for an assistant
+// bubble and return its body node. Inserted before the content span so the
+// thought process reads above the answer.
+function reasoningBody(out) {
+  const wrap = out.parentElement;
+  let el = wrap.querySelector(":scope > .reasoning");
+  if (!el) {
+    el = document.createElement("details");
+    el.className = "reasoning";
+    el.open = !settings.collapseReasoning;
+    const summary = document.createElement("summary");
+    summary.textContent = "reasoning";
+    const body = document.createElement("div");
+    body.className = "reasoning-body";
+    el.append(summary, body);
+    wrap.insertBefore(el, out);
+  }
+  return el.querySelector(".reasoning-body");
+}
+
+// Render a streamed assistant accumulator live: reasoning to its own block,
+// answer to the content span.
+function renderAssistant(out, acc) {
+  const { thinking, content } = splitThinking(acc);
+  if (thinking) reasoningBody(out).textContent = thinking;
+  out.textContent = ` ${content}`;
+}
+
 // ─── code-block downloads ──────────────────────────────────────────
 // When the model emits fenced code blocks with a language tag (e.g.
 // ```html), surface a download button next to the assistant bubble so
@@ -854,7 +910,16 @@ function extractCodeBlocks(text) {
     }
     blocks.push({ filename, body: body.replace(/\s+$/, "") + "\n", lang: lang || "text" });
   }
-  return blocks;
+  // Dedupe identical snippets: a reasoning model may emit the same artifact
+  // in both its answer and its thinking channel, and we scan both — keep the
+  // first occurrence (answer-channel wins, since scanText lists it first).
+  const seen = new Set();
+  return blocks.filter((b) => {
+    const key = b.body.trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function appendCodeDownloads(msgWrap, blocks) {
@@ -1197,6 +1262,29 @@ async function send() {
   input.value = "";
   autosize();
 
+  // ─── /check slash command (cellc, Phase 1) ────────────────────────
+  if (text.startsWith("/check") && typeof window.cellc !== "undefined") {
+    const tail = text.slice("/check".length).trim();
+    let src = tail;
+    if (!src) {
+      // Scan history for the most recent assistant .cell/.cellscript fence
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role !== "assistant") continue;
+        const m = history[i].content.match(/```(?:cell|cellscript)\n([\s\S]*?)```/i);
+        if (m) { src = m[1]; break; }
+      }
+    }
+    if (!src) {
+      appendMsg("system", "/check: provide source after /check, or ask the model to write a .cell block first");
+    } else {
+      const out = appendMsg("system", "checking…");
+      const result = await window.cellc.checkSource(src);
+      out.textContent = ` ${result}`;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+    return;
+  }
+
   // Translate mode: routed when the active model is a TranslateGemma
   // tag. We don't push to chat history — each translation is fresh —
   // but the user's input still appears in the messages stream so they
@@ -1290,7 +1378,7 @@ async function send() {
       if (done) break;
       acc += dec.decode(value, { stream: true });
       if (thinking) stopThinking();  // first chunk wins
-      out.textContent = ` ${acc}`;
+      renderAssistant(out, acc);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
@@ -1300,12 +1388,15 @@ async function send() {
     const { stats, cleanedText: noStats } = parseStatsSentinel(acc);
     if (stats) updateStatsBar(stats);
     const { calls: toolCalls, cleanedText } = parseToolCallSentinel(noStats);
+    // Separate the reasoning channel before op/fence processing so tool
+    // detection and the visible answer consider only the model's answer.
+    const { thinking: reasoning, content: answerText } = splitThinking(cleanedText);
     // Strip op fences from displayed text too — they're already shown as
     // confirm cards below, so leaving them as raw JSON in the assistant
     // line is just noise.
-    const opCalls = parseOpFromText(cleanedText);
+    const opCalls = parseOpFromText(answerText);
     const allCalls = [...toolCalls, ...opCalls];
-    const textWithoutFences = cleanedText.replace(OP_FENCE_RE, "").trim();
+    const textWithoutFences = answerText.replace(OP_FENCE_RE, "").trim();
 
     // Pure-tool-caller path: model emitted only structured calls, no prose.
     // Replace the blank line with a one-line summary so the user knows
@@ -1317,13 +1408,16 @@ async function send() {
     } else if (!displayedText && !allCalls.length) {
       displayedText = "[empty response]";
     }
+    if (reasoning) reasoningBody(out).textContent = reasoning;
     out.textContent = ` ${displayedText}`;
     history.push({ role: "assistant", content: displayedText });
 
-    // Surface any fenced code blocks (```html, ```py, etc.) as
-    // download buttons under the assistant bubble. Scans the same text
-    // the user sees, so what's displayed and what's downloaded match.
-    appendCodeDownloads(out.parentElement, extractCodeBlocks(displayedText));
+    // Surface any fenced code blocks (```html, ```py, etc.) as download
+    // buttons under the assistant bubble. Scans the answer AND the reasoning
+    // — some models (GLM-4.7-flash) emit the actual artifact inside their
+    // thinking, so scanning only the answer would drop the download button.
+    const scanText = reasoning ? `${displayedText}\n\n${reasoning}` : displayedText;
+    appendCodeDownloads(out.parentElement, extractCodeBlocks(scanText));
 
     // One card at a time — y/n/e handler operates on a single pending card.
     // If the model emits multiple, queue them sequentially.
@@ -1514,6 +1608,7 @@ const settingsBackdrop = document.getElementById("settings-backdrop");
 const settingsClose = document.getElementById("settings-close");
 const settingsSpinnerSel = document.getElementById("settings-spinner");
 const settingsPreview = document.getElementById("settings-spinner-preview");
+const settingsCollapseReasoning = document.getElementById("settings-collapse-reasoning");
 
 let previewStop = null;
 
@@ -1525,6 +1620,7 @@ function startPreview() {
 function openSettings() {
   settingsSpinnerSel.replaceChildren(...Object.keys(SPINNERS).map((k) => makeOption(k)));
   settingsSpinnerSel.value = settings.spinner;
+  settingsCollapseReasoning.checked = !!settings.collapseReasoning;
   startPreview();
   renderCapsDisplay();
   settingsPanel.classList.remove("hidden");
@@ -1547,6 +1643,14 @@ settingsSpinnerSel.addEventListener("change", () => {
   settings.spinner = settingsSpinnerSel.value;
   saveSettings();
   startPreview();
+});
+settingsCollapseReasoning.addEventListener("change", () => {
+  settings.collapseReasoning = settingsCollapseReasoning.checked;
+  saveSettings();
+  // Apply immediately to any reasoning blocks already on screen.
+  document.querySelectorAll(".msg.assistant .reasoning").forEach((el) => {
+    el.open = !settings.collapseReasoning;
+  });
 });
 
 // ─── settings: capability re-probe ────────────────────────────────
@@ -1646,3 +1750,45 @@ document.getElementById("settings-reset").addEventListener("click", () => {
 });
 
 bootstrap().then(handleSharedParam);
+
+// ─── cellc (CellScript) check affordance — Phase 1, human-driven ──────
+(function cellcAffordance() {
+  let cellcEnabled = false;
+
+  async function refreshCellcStatus() {
+    try {
+      const r = await fetch("/api/cellc/status");
+      cellcEnabled = r.ok && (await r.json()).available === true;
+    } catch { cellcEnabled = false; }
+    document.body.classList.toggle("cellc-enabled", cellcEnabled);
+  }
+
+  function renderCheckResult(data) {
+    if (data.tool_error) return `cellc error: ${data.stderr || "unknown"}`;
+    if (data.ok) return "✓ cellc check passed";
+    const lines = (data.diagnostics || []).map(
+      (d) => `  L${d.line}:C${d.column} [${d.code || "—"}] ${d.message}`
+    );
+    let out = `✗ ${data.error_count} error(s)\n` + lines.join("\n");
+    if (data.truncated) out += `\n  …(+${data.truncated} more)`;
+    return out;
+  }
+
+  async function checkSource(source) {
+    if (!cellcEnabled) return "cellc is not available on this server.";
+    try {
+      const r = await fetch("/api/cellc/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source }),
+      });
+      if (r.status === 503) return "cellc is not available on this server.";
+      if (!r.ok) return `cellc check failed: HTTP ${r.status}`;
+      return renderCheckResult(await r.json());
+    } catch (e) { return `cellc check failed: ${e}`; }
+  }
+
+  // Expose for the slash-command handler + fence buttons to call.
+  window.cellc = { checkSource, refreshCellcStatus, get enabled() { return cellcEnabled; } };
+  refreshCellcStatus();
+})();
