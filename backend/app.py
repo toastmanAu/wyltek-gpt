@@ -269,6 +269,86 @@ async def list_models():
 THINK_OPEN = "THINK"
 THINK_CLOSE = "/THINK"
 
+MAX_CELLC_ITERS = 5
+
+
+async def _stream_one(body: dict):
+    """Stream one POST to Ollama. Yields:
+        ('chunk', str)           — model text chunks
+        ('tool_calls', list)     — final tool_calls payload, if any
+        ('stats', dict)          — timing/token counters from Ollama's done frame
+        ('error', dict)          — Ollama returned non-2xx; dict has 'status' + 'error'
+        ('done', None)           — stream completed normally
+    """
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=body) as r:
+            if r.status_code != 200:
+                raw = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                try:
+                    err = json.loads(raw).get("error", raw)
+                except json.JSONDecodeError:
+                    err = raw
+                yield "error", {"status": r.status_code, "error": err}
+                return
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = data.get("message", {}) or {}
+                reasoning = msg.get("thinking")
+                if reasoning:
+                    yield "thinking", reasoning
+                chunk = msg.get("content")
+                if chunk:
+                    yield "chunk", chunk
+                tool_calls = msg.get("tool_calls")
+                if tool_calls:
+                    yield "tool_calls", tool_calls
+                if data.get("done"):
+                    # Surface Ollama's perf counters to the UI stats bar.
+                    # All durations are nanoseconds; the frontend converts.
+                    stats = {
+                        "model": data.get("model") or body.get("model"),
+                        "load_ns": data.get("load_duration", 0),
+                        "prompt_eval_count": data.get("prompt_eval_count", 0),
+                        "prompt_eval_ns": data.get("prompt_eval_duration", 0),
+                        "eval_count": data.get("eval_count", 0),
+                        "eval_ns": data.get("eval_duration", 0),
+                        "total_ns": data.get("total_duration", 0),
+                    }
+                    yield "stats", stats
+                    yield "done", None
+                    return
+            yield "done", None
+
+
+def _partition_cellc_calls(tool_calls):
+    """Split a tool_calls list into (cellc_calls, op_calls)."""
+    cellc_calls, op_calls = [], []
+    for tc in tool_calls or []:
+        name = (tc.get("function") or {}).get("name")
+        (cellc_calls if name in cellc_bridge.CELLC_TOOL_NAMES else op_calls).append(tc)
+    return cellc_calls, op_calls
+
+
+def _summarize_cellc_step(name, result):
+    """Return a short human-readable summary of a cellc tool result."""
+    if result.get("tool_error"):
+        return f"\u26a0 {name}: {result.get('stderr', 'error')[:80]}"
+    if name == "cellc_check":
+        if result.get("ok"):
+            return "cellc_check \u2192 \u2713 passed"
+        lines = ", ".join(f"L{d.get('line')}" for d in (result.get("diagnostics") or [])[:3])
+        return f"cellc_check \u2192 \u2717 {result.get('error_count', 0)} error(s) ({lines})"
+    if name == "cellc_explain":
+        return f"cellc_explain \u2192 {result.get('ecode', '')}"
+    return f"{name} \u2192 ok"
+
+
+
 
 @app.post("/api/chat")
 async def chat(payload: dict):
@@ -309,62 +389,14 @@ async def chat(payload: dict):
                     log.info("chat: attached %d image(s) to %s", len(images_b64), model)
                     break
 
+    tools = OPERATIONS.tool_schemas() if OPERATIONS.enabled else []
+    if cellc_bridge.available():
+        tools = tools + cellc_bridge.tool_schemas()
     body_with_tools: dict = {"model": model, "messages": messages, "stream": True}
-    if OPERATIONS.enabled:
-        body_with_tools["tools"] = OPERATIONS.tool_schemas()
+    if tools:
+        body_with_tools["tools"] = tools
     body_without_tools: dict = {"model": model, "messages": messages, "stream": True}
 
-    async def _stream_one(body: dict):
-        """Stream one POST to Ollama. Yields:
-            ('chunk', str)           — model text chunks
-            ('tool_calls', list)     — final tool_calls payload, if any
-            ('stats', dict)          — timing/token counters from Ollama's done frame
-            ('error', dict)          — Ollama returned non-2xx; dict has 'status' + 'error'
-            ('done', None)           — stream completed normally
-        """
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=body) as r:
-                if r.status_code != 200:
-                    raw = (await r.aread()).decode("utf-8", errors="replace")[:500]
-                    try:
-                        err = json.loads(raw).get("error", raw)
-                    except json.JSONDecodeError:
-                        err = raw
-                    yield "error", {"status": r.status_code, "error": err}
-                    return
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = data.get("message", {}) or {}
-                    reasoning = msg.get("thinking")
-                    if reasoning:
-                        yield "thinking", reasoning
-                    chunk = msg.get("content")
-                    if chunk:
-                        yield "chunk", chunk
-                    tool_calls = msg.get("tool_calls")
-                    if tool_calls:
-                        yield "tool_calls", tool_calls
-                    if data.get("done"):
-                        # Surface Ollama's perf counters to the UI stats bar.
-                        # All durations are nanoseconds; the frontend converts.
-                        stats = {
-                            "model": data.get("model") or body.get("model"),
-                            "load_ns": data.get("load_duration", 0),
-                            "prompt_eval_count": data.get("prompt_eval_count", 0),
-                            "prompt_eval_ns": data.get("prompt_eval_duration", 0),
-                            "eval_count": data.get("eval_count", 0),
-                            "eval_ns": data.get("eval_duration", 0),
-                            "total_ns": data.get("total_duration", 0),
-                        }
-                        yield "stats", stats
-                        yield "done", None
-                        return
-                yield "done", None
 
     async def stream():
         # First attempt: with tools. If Ollama rejects (the model doesn't
@@ -376,7 +408,7 @@ async def chat(payload: dict):
         attempted_fallback = False
         in_thinking = False
 
-        async def relay(source):
+        async def relay(source, messages, iterations):
             nonlocal attempted_fallback, in_thinking
             async for kind, value in source:
                 if kind == "thinking":
@@ -390,7 +422,29 @@ async def chat(payload: dict):
                         yield THINK_CLOSE
                     yield value
                 elif kind == "tool_calls":
-                    yield "\n" + json.dumps({"__tool_calls__": value})
+                    cellc_calls, op_calls = _partition_cellc_calls(value)
+                    if op_calls:
+                        yield "\n" + json.dumps({"__tool_calls__": op_calls})
+                    if cellc_calls and iterations < MAX_CELLC_ITERS:
+                        if in_thinking:
+                            in_thinking = False
+                            yield THINK_CLOSE
+                        tool_msgs = []
+                        for c in cellc_calls:
+                            name = c["function"]["name"]
+                            args = c["function"].get("arguments") or {}
+                            try:
+                                result = await asyncio.to_thread(cellc_bridge.dispatch, name, args)
+                            except Exception as exc:  # dispatch must never break the stream
+                                result = {"ok": False, "tool_error": True, "exit_code": -1, "stderr": str(exc)}
+                            yield "\n" + json.dumps({"__cellc_step__": {"tool": name, "summary": _summarize_cellc_step(name, result)}}) + "\n"
+                            tool_msgs.append({"role": "tool", "tool_name": name, "content": json.dumps(result)})
+                        new_messages = messages + [{"role": "assistant", "content": "", "tool_calls": cellc_calls}, *tool_msgs]
+                        async for wire in relay(_stream_one({**body_with_tools, "messages": new_messages}), new_messages, iterations + 1):
+                            yield wire
+                        return
+                    if cellc_calls and iterations >= MAX_CELLC_ITERS:
+                        yield "\n" + json.dumps({"__cellc_step__": {"tool": "cellc", "summary": "(reached cellc check limit)"}}) + "\n"
                 elif kind == "stats":
                     if in_thinking:
                         in_thinking = False
@@ -403,7 +457,7 @@ async def chat(payload: dict):
                             and OPERATIONS.enabled):
                         log.info("model %s rejected tools — retrying without", model)
                         attempted_fallback = True
-                        async for wire in relay(_stream_one(body_without_tools)):
+                        async for wire in relay(_stream_one(body_without_tools), messages, iterations):
                             yield wire
                         return
                     if in_thinking:
@@ -417,7 +471,7 @@ async def chat(payload: dict):
                         yield THINK_CLOSE
                     return
 
-        async for wire in relay(_stream_one(body_with_tools)):
+        async for wire in relay(_stream_one(body_with_tools), messages, 0):
             yield wire
 
     return StreamingResponse(stream(), media_type="text/plain")
