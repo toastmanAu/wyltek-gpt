@@ -685,6 +685,28 @@ function parseStatsSentinel(text) {
   }
 }
 
+// Extract ALL `{"__cellc_step__": {...}}` sentinel lines (they interleave with
+// text across loop iterations, unlike the single __stats__/__tool_calls__).
+// Returns {steps: [{tool, summary}], cleanedText}.
+function parseCellcSteps(text) {
+  const steps = [];
+  const lines = text.split("\n");
+  const kept = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith('{"__cellc_step__"')) {
+      try { steps.push(JSON.parse(t).__cellc_step__); continue; } catch {}
+    }
+    kept.push(line);
+  }
+  return { steps, cleanedText: kept.join("\n") };
+}
+
+function renderCellcSteps(steps) {
+  if (!steps.length) return "";
+  return steps.map((s) => `\n🔧 ${s.summary}`).join("");
+}
+
 // ─── reasoning (thinking) channel ──────────────────────────────────
 // Reasoning models (GLM-4.7-flash, qwen3.6) stream their chain-of-thought
 // on a separate Ollama `thinking` field. The backend splices that run into
@@ -1382,10 +1404,12 @@ async function send() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    // Strip both sentinels (tool_calls + stats) out of displayed text and
-    // surface what each carries to the right place — tool calls render as
-    // confirm cards below, stats update the perf bar above the composer.
-    const { stats, cleanedText: noStats } = parseStatsSentinel(acc);
+    // Strip all sentinels out of displayed text. cellc steps are stripped
+    // first (multiple interleaved occurrences), then the once-at-end
+    // stats/tool_calls sentinels. Each parser hands its cleanedText to
+    // the next in the chain.
+    const { steps: cellcSteps, cleanedText: noSteps } = parseCellcSteps(acc);
+    const { stats, cleanedText: noStats } = parseStatsSentinel(noSteps);
     if (stats) updateStatsBar(stats);
     const { calls: toolCalls, cleanedText } = parseToolCallSentinel(noStats);
     // Separate the reasoning channel before op/fence processing so tool
@@ -1409,7 +1433,10 @@ async function send() {
       displayedText = "[empty response]";
     }
     if (reasoning) reasoningBody(out).textContent = reasoning;
-    out.textContent = ` ${displayedText}`;
+    const stepsHint = renderCellcSteps(cellcSteps);
+    out.textContent = stepsHint
+      ? ` ${stepsHint.trim()}\n\n${displayedText}`
+      : ` ${displayedText}`;
     history.push({ role: "assistant", content: displayedText });
 
     // Surface any fenced code blocks (```html, ```py, etc.) as download
