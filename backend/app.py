@@ -383,9 +383,11 @@ async def chat(payload: dict):
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
 
+    cellc_chat = False
     if cellc_bridge.available():
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
         if _is_cellc_intent(last_user):
+            cellc_chat = True
             ref = cellc_bridge.language_reference()
             messages[0]["content"] = messages[0]["content"] + "\n\n# CellScript language reference\n" + ref
 
@@ -411,10 +413,24 @@ async def chat(payload: dict):
     tools = OPERATIONS.tool_schemas() if OPERATIONS.enabled else []
     if cellc_bridge.available():
         tools = tools + cellc_bridge.tool_schemas()
-    body_with_tools: dict = {"model": model, "messages": messages, "stream": True}
+    # Ollama defaults num_ctx to ~4096 regardless of the model's real window,
+    # which truncates multi-turn agentic loops (system prompt + tool results +
+    # the model's own reasoning). Give the loop room; caller may override.
+    _options = {"num_ctx": int(payload.get("num_ctx") or _CHAT_DEFAULT_NUM_CTX)}
+    body_with_tools: dict = {"model": model, "messages": messages, "stream": True, "options": _options}
     if tools:
         body_with_tools["tools"] = tools
-    body_without_tools: dict = {"model": model, "messages": messages, "stream": True}
+    body_without_tools: dict = {"model": model, "messages": messages, "stream": True, "options": _options}
+    # Reasoning models (e.g. qwen3.6) over-deliberate on hard CellScript tasks —
+    # they draft the whole contract inside the <think> channel and exhaust the
+    # generation budget before ever emitting a cellc_check tool call. Bounded
+    # thinking ("low") keeps enough reasoning to ground on the reference while
+    # forcing the model to ACT (call tools) so the write→check→fix loop runs.
+    # Only for cellc chats; normal chats keep the model's default thinking.
+    if cellc_chat:
+        think = payload.get("think", "low")
+        body_with_tools["think"] = think
+        body_without_tools["think"] = think
 
 
     async def stream():
@@ -589,6 +605,10 @@ async def enhance(payload: dict):
 _LANG_CODE_RE = re.compile(r"^[a-z]{2}(?:[-_][A-Za-z]{2,4})?$")
 _TRANSLATE_MAX_TEXT_CHARS = 8000
 _TRANSLATE_DEFAULT_NUM_CTX = 2048
+# Default context window for /api/chat. Ollama otherwise caps unspecified
+# num_ctx at ~4096, which truncates agentic cellc loops. 16k fits qwen3.6:27b
+# Q4 on a 24GB card with VRAM free; callers can override via payload num_ctx.
+_CHAT_DEFAULT_NUM_CTX = 16384
 
 
 @app.post("/api/operations/translate")
@@ -845,9 +865,14 @@ def _is_cellc_intent(text: str) -> bool:
 
 
 _CELLC_PROMPT_HINT = (
-    "\n\nCellScript (.cell) tooling is available: call cellc_check to verify "
-    "Cell contracts, cellc_language_reference for syntax, and cellc_save (with "
-    "confirmation) to store a checked contract."
+    "\n\nCellScript (.cell) tooling is available. Workflow: write the contract, "
+    "call cellc_check to verify it, and if it reports errors read them and fix "
+    "the contract, then check again, until it passes. Once cellc_check passes, "
+    "call cellc_save with the EXACT source you just verified to persist it as a "
+    "file — do not retype or reformat the contract in your reply, because edits "
+    "made after verification are unverified; the saved file is the source of "
+    "truth. The CellScript language reference is already provided above; you do "
+    "not need a tool to fetch it."
 )
 
 _CELLC_MAX_SOURCE = 200_000

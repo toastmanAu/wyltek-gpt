@@ -6,7 +6,7 @@ from backend.bridges import cellc
 def test_tool_schemas_shape():
     schemas = cellc.tool_schemas()
     names = {s["function"]["name"] for s in schemas}
-    assert {"cellc_check", "cellc_explain", "cellc_get_example", "cellc_language_reference"} <= names
+    assert {"cellc_check", "cellc_explain", "cellc_get_example"} <= names
     for s in schemas:
         assert s["type"] == "function"
         assert "parameters" in s["function"]
@@ -51,16 +51,20 @@ def test_dispatch_language_reference_no_args():
     assert out == {"reference": "REF"}
 
 
-def test_tool_schemas_has_six_tools():
+def test_tool_schemas_five_loop_tools():
+    # cellc_language_reference is intentionally NOT a loop tool (it's injected
+    # into the system prompt instead — avoids a wasted re-fetch turn).
     names = {s["function"]["name"] for s in cellc.tool_schemas()}
     assert names == {
         "cellc_check", "cellc_explain", "cellc_get_example",
-        "cellc_language_reference", "cellc_metadata", "cellc_list_examples",
+        "cellc_metadata", "cellc_list_examples",
     }
+    assert "cellc_language_reference" not in names
 
 
-def test_cellc_tool_names_has_six():
-    assert len(cellc.CELLC_TOOL_NAMES) == 6
+def test_cellc_tool_names_has_five():
+    assert len(cellc.CELLC_TOOL_NAMES) == 5
+    assert "cellc_language_reference" not in cellc.CELLC_TOOL_NAMES
     assert "cellc_metadata" in cellc.CELLC_TOOL_NAMES
     assert "cellc_list_examples" in cellc.CELLC_TOOL_NAMES
 

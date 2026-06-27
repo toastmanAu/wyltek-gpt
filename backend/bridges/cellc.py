@@ -75,9 +75,14 @@ PROFILES = {"ckb"}
 CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# cellc_language_reference is NOT a loop tool: the full reference is already
+# injected into the system prompt on cellc-intent chats (see app.py
+# _is_cellc_intent), so advertising it as a tool only makes the model waste a
+# turn re-fetching content it already has. The /api/cellc/reference endpoint
+# and the dispatch arm remain for direct/human use.
 CELLC_TOOL_NAMES = frozenset({
     "cellc_check", "cellc_explain", "cellc_get_example",
-    "cellc_language_reference", "cellc_metadata", "cellc_list_examples",
+    "cellc_metadata", "cellc_list_examples",
 })
 
 
@@ -105,9 +110,6 @@ def tool_schemas() -> list[dict]:
            "Return a bundled example .cell contract's source by name (e.g. token, nft).",
            {"name": {"type": "string", "description": "example name"}},
            ["name"]),
-        fn("cellc_language_reference",
-           "Return the full CellScript language surface (keywords, effects, a worked example).",
-           {}, []),
         fn("cellc_metadata",
            "Compiler metadata for a contract: resources, actions, effects, obligations (summary).",
            {"source": {"type": "string", "description": "full .cell source"},
