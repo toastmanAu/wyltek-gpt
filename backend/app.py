@@ -163,11 +163,14 @@ def _operations_prompt_block() -> str:
 
 def _full_system_prompt() -> str:
     """Base prompt + dynamic host facts + operations manifest."""
-    return (
+    base = (
         CONFIG["assistant"]["system_prompt"]
         + host_context_block()
         + _operations_prompt_block()
     )
+    if cellc_bridge.available():
+        base = base + _CELLC_PROMPT_HINT
+    return base
 
 
 # ─── Existing endpoints (config / themes / models / chat / converters) ──
@@ -376,6 +379,12 @@ async def chat(payload: dict):
 
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
+
+    if cellc_bridge.available():
+        last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
+        if _is_cellc_intent(last_user):
+            ref = cellc_bridge.language_reference()
+            messages[0]["content"] = messages[0]["content"] + "\n\n# CellScript language reference\n" + ref
 
     if image_files:
         images_b64: list[str] = []
@@ -796,6 +805,23 @@ async def _run_bridge_op(
 
 # `re` and `asyncio` are already imported at the top of backend/app.py
 # (lines 3 and 8) — use them directly; do NOT add duplicate imports.
+
+_CELLC_INTENT_RE = re.compile(
+    r"cellscript|\.cell\b|cell contract|ckb contract|nervos contract|\bcellc\b|resource\s+\w+\s+has",
+    re.IGNORECASE,
+)
+
+
+def _is_cellc_intent(text: str) -> bool:
+    return bool(_CELLC_INTENT_RE.search(text or ""))
+
+
+_CELLC_PROMPT_HINT = (
+    "\n\nCellScript (.cell) tooling is available: call cellc_check to verify "
+    "Cell contracts, cellc_language_reference for syntax, and cellc_save (with "
+    "confirmation) to store a checked contract."
+)
+
 _CELLC_MAX_SOURCE = 200_000
 _CELLC_PROFILES = {"ckb"}
 _CELLC_CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
