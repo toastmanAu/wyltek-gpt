@@ -712,6 +712,8 @@ async def run_operation(payload: dict):
         out = await _run_bridge_op(op, session_dir, validated)
     elif op.kind == "converter":
         out = await _run_converter_op(session_dir, validated)
+    elif op.kind == "cellc_save":
+        out = await _run_cellc_save_op(op, session_dir, validated)
     else:
         raise HTTPException(500, f"unknown op kind {op.kind!r}")
 
@@ -725,6 +727,29 @@ async def run_operation(payload: dict):
         "mirror": str(mirrored) if mirrored else None,
         "url": f"/api/files/{session_id}/{out.name}",
     }
+
+
+_CELLC_SAVE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _run_cellc_save_op_sync(session_dir: Path, validated: dict) -> Path:
+    name = validated["name"]
+    if not _CELLC_SAVE_NAME_RE.match(name):
+        raise HTTPException(400, "invalid save name (letters, digits, _ or - only)")
+    source = validated["source"]
+    result = cellc_bridge.check(source)
+    if not result.get("ok"):
+        diags = result.get("diagnostics") or []
+        first = diags[0].get("message") if diags else "check failed"
+        raise HTTPException(400, f"refusing to save: cellc_check failed ({result.get('error_count', '?')} error(s)): {first}")
+    target = (session_dir / f"{name}.cell").resolve()
+    target.relative_to(session_dir.resolve())  # path-traversal guard
+    target.write_text(source, encoding="utf-8")
+    return target
+
+
+async def _run_cellc_save_op(op, session_dir: Path, validated: dict) -> Path:
+    return await asyncio.to_thread(_run_cellc_save_op_sync, session_dir, validated)
 
 
 async def _run_local_op(
