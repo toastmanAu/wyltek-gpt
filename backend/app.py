@@ -433,15 +433,18 @@ async def chat(payload: dict):
                         for c in cellc_calls:
                             name = c["function"]["name"]
                             args = c["function"].get("arguments") or {}
-                            result = await asyncio.to_thread(cellc_bridge.dispatch, name, args)
-                            yield "\n" + json.dumps({"__cellc_step__": {"tool": name, "summary": _summarize_cellc_step(name, result)}})
+                            try:
+                                result = await asyncio.to_thread(cellc_bridge.dispatch, name, args)
+                            except Exception as exc:  # dispatch must never break the stream
+                                result = {"ok": False, "tool_error": True, "exit_code": -1, "stderr": str(exc)}
+                            yield "\n" + json.dumps({"__cellc_step__": {"tool": name, "summary": _summarize_cellc_step(name, result)}}) + "\n"
                             tool_msgs.append({"role": "tool", "tool_name": name, "content": json.dumps(result)})
                         new_messages = messages + [{"role": "assistant", "content": "", "tool_calls": cellc_calls}, *tool_msgs]
                         async for wire in relay(_stream_one({**body_with_tools, "messages": new_messages}), new_messages, iterations + 1):
                             yield wire
                         return
                     if cellc_calls and iterations >= MAX_CELLC_ITERS:
-                        yield "\n" + json.dumps({"__cellc_step__": {"tool": "cellc", "summary": "(reached cellc check limit)"}})
+                        yield "\n" + json.dumps({"__cellc_step__": {"tool": "cellc", "summary": "(reached cellc check limit)"}}) + "\n"
                 elif kind == "stats":
                     if in_thinking:
                         in_thinking = False
