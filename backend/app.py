@@ -345,6 +345,13 @@ def _summarize_cellc_step(name, result):
         return f"cellc_check \u2192 \u2717 {result.get('error_count', 0)} error(s) ({lines})"
     if name == "cellc_explain":
         return f"cellc_explain \u2192 {result.get('ecode', '')}"
+    if name == "cellc_metadata":
+        res = result.get("resources_count", 0)
+        act = result.get("actions_count", 0)
+        return f"cellc_metadata \u2192 {res} resources, {act} actions"
+    if name == "cellc_list_examples":
+        n = len(result.get("examples", []))
+        return f"cellc_list_examples \u2192 {n} examples"
     return f"{name} \u2192 ok"
 
 

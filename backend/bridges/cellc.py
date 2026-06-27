@@ -75,9 +75,10 @@ PROFILES = {"ckb"}
 CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
-CELLC_TOOL_NAMES = frozenset(
-    {"cellc_check", "cellc_explain", "cellc_get_example", "cellc_language_reference"}
-)
+CELLC_TOOL_NAMES = frozenset({
+    "cellc_check", "cellc_explain", "cellc_get_example",
+    "cellc_language_reference", "cellc_metadata", "cellc_list_examples",
+})
 
 
 def tool_schemas() -> list[dict]:
@@ -106,6 +107,14 @@ def tool_schemas() -> list[dict]:
            ["name"]),
         fn("cellc_language_reference",
            "Return the full CellScript language surface (keywords, effects, a worked example).",
+           {}, []),
+        fn("cellc_metadata",
+           "Compiler metadata for a contract: resources, actions, effects, obligations (summary).",
+           {"source": {"type": "string", "description": "full .cell source"},
+            "target_profile": {"type": "string", "enum": ["ckb"], "description": "target profile (default ckb)"}},
+           ["source"]),
+        fn("cellc_list_examples",
+           "List bundled example .cell contracts (names + one-line summaries).",
            {}, []),
     ]
 
@@ -141,4 +150,6 @@ def dispatch(name: str, arguments: dict) -> dict:
         return get_example(ex)
     if name == "cellc_language_reference":
         return {"reference": language_reference()}
+    if name == "cellc_list_examples":
+        return {"examples": list_examples()}
     return _tool_err(f"unknown cellc tool {name!r}")
