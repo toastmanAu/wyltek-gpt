@@ -16,10 +16,15 @@ def test_is_cellc_intent_false():
 
 def test_full_system_prompt_has_hint_when_available(monkeypatch):
     monkeypatch.setattr(app_module.cellc_bridge, "available", lambda: True)
-    assert "cellc_check" in app_module._full_system_prompt()
+    # Assert on the actual hint block, not a bare substring: "cellc_check" can
+    # also appear via a registered op's description (e.g. cellc_save), so the
+    # canonical signal is the hint text itself.
+    assert app_module._CELLC_PROMPT_HINT in app_module._full_system_prompt()
 
 
 def test_full_system_prompt_no_hint_when_unavailable(monkeypatch):
     monkeypatch.setattr(app_module.cellc_bridge, "available", lambda: False)
-    # base prompt should not advertise cellc tooling
-    assert "cellc_check" not in app_module._full_system_prompt()
+    # The hint block must be absent; do NOT assert on bare "cellc_check", which
+    # legitimately appears in the cellc_save op description when that op is
+    # registered (CELLC_BIN set in the environment).
+    assert app_module._CELLC_PROMPT_HINT not in app_module._full_system_prompt()
