@@ -386,10 +386,7 @@ async def chat(payload: dict):
     cellc_chat = False
     if cellc_bridge.available():
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
-        if _is_cellc_intent(last_user):
-            cellc_chat = True
-            ref = cellc_bridge.language_reference()
-            messages[0]["content"] = messages[0]["content"] + "\n\n# CellScript language reference\n" + ref
+        cellc_chat = _inject_cellc_context(messages, last_user)
 
     if image_files:
         images_b64: list[str] = []
@@ -874,6 +871,18 @@ _CELLC_PROMPT_HINT = (
     "truth. The CellScript language reference is already provided above; you do "
     "not need a tool to fetch it."
 )
+
+def _inject_cellc_context(messages: list, last_user: str) -> bool:
+    """If cellc is available and the message looks CellScript-related, append the
+    language reference + design notes to the system message. Returns True if so."""
+    if not (cellc_bridge.available() and _is_cellc_intent(last_user)):
+        return False
+    messages[0]["content"] += "\n\n# CellScript language reference\n" + cellc_bridge.language_reference()
+    notes = cellc_bridge.design_notes()
+    if notes:
+        messages[0]["content"] += "\n\n# CellScript design notes\n" + notes
+    return True
+
 
 _CELLC_MAX_SOURCE = 200_000
 _CELLC_PROFILES = {"ckb"}
