@@ -24,6 +24,7 @@ from backend.host_context import host_context_block
 from backend.operations import (
     Operation,
     OperationRegistry,
+    make_cellc_save_operation,
     make_converter_operation,
     run_local,
     validate_params,
@@ -87,6 +88,8 @@ for _conv in REGISTRY.enabled:
     _REACHABLE_TARGETS.update(_conv.targets)
 if _REACHABLE_TARGETS:
     OPERATIONS.add(make_converter_operation(tuple(sorted(_REACHABLE_TARGETS))))
+if cellc_bridge.available():
+    OPERATIONS.add(make_cellc_save_operation())
 
 log.info("operations: %d enabled, %d disabled", len(OPERATIONS.enabled), len(OPERATIONS.missing))
 
@@ -163,11 +166,14 @@ def _operations_prompt_block() -> str:
 
 def _full_system_prompt() -> str:
     """Base prompt + dynamic host facts + operations manifest."""
-    return (
+    base = (
         CONFIG["assistant"]["system_prompt"]
         + host_context_block()
         + _operations_prompt_block()
     )
+    if cellc_bridge.available():
+        base = base + _CELLC_PROMPT_HINT
+    return base
 
 
 # ─── Existing endpoints (config / themes / models / chat / converters) ──
@@ -345,6 +351,13 @@ def _summarize_cellc_step(name, result):
         return f"cellc_check \u2192 \u2717 {result.get('error_count', 0)} error(s) ({lines})"
     if name == "cellc_explain":
         return f"cellc_explain \u2192 {result.get('ecode', '')}"
+    if name == "cellc_metadata":
+        res = result.get("resources_count", 0)
+        act = result.get("actions_count", 0)
+        return f"cellc_metadata \u2192 {res} resources, {act} actions"
+    if name == "cellc_list_examples":
+        n = len(result.get("examples", []))
+        return f"cellc_list_examples \u2192 {n} examples"
     return f"{name} \u2192 ok"
 
 
@@ -369,6 +382,12 @@ async def chat(payload: dict):
 
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
+
+    if cellc_bridge.available():
+        last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
+        if _is_cellc_intent(last_user):
+            ref = cellc_bridge.language_reference()
+            messages[0]["content"] = messages[0]["content"] + "\n\n# CellScript language reference\n" + ref
 
     if image_files:
         images_b64: list[str] = []
@@ -693,6 +712,8 @@ async def run_operation(payload: dict):
         out = await _run_bridge_op(op, session_dir, validated)
     elif op.kind == "converter":
         out = await _run_converter_op(session_dir, validated)
+    elif op.kind == "cellc_save":
+        out = await _run_cellc_save_op(op, session_dir, validated)
     else:
         raise HTTPException(500, f"unknown op kind {op.kind!r}")
 
@@ -706,6 +727,29 @@ async def run_operation(payload: dict):
         "mirror": str(mirrored) if mirrored else None,
         "url": f"/api/files/{session_id}/{out.name}",
     }
+
+
+_CELLC_SAVE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _run_cellc_save_op_sync(session_dir: Path, validated: dict) -> Path:
+    name = validated["name"]
+    if not _CELLC_SAVE_NAME_RE.match(name):
+        raise HTTPException(400, "invalid save name (letters, digits, _ or - only)")
+    source = validated["source"]
+    result = cellc_bridge.check(source)
+    if not result.get("ok"):
+        diags = result.get("diagnostics") or []
+        first = diags[0].get("message") if diags else "check failed"
+        raise HTTPException(400, f"refusing to save: cellc_check failed ({result.get('error_count', '?')} error(s)): {first}")
+    target = (session_dir / f"{name}.cell").resolve()
+    target.relative_to(session_dir.resolve())  # path-traversal guard
+    target.write_text(source, encoding="utf-8")
+    return target
+
+
+async def _run_cellc_save_op(op, session_dir: Path, validated: dict) -> Path:
+    return await asyncio.to_thread(_run_cellc_save_op_sync, session_dir, validated)
 
 
 async def _run_local_op(
@@ -789,6 +833,23 @@ async def _run_bridge_op(
 
 # `re` and `asyncio` are already imported at the top of backend/app.py
 # (lines 3 and 8) — use them directly; do NOT add duplicate imports.
+
+_CELLC_INTENT_RE = re.compile(
+    r"cellscript|\.cell\b|cell contract|ckb contract|nervos contract|\bcellc\b|resource\s+\w+\s+has",
+    re.IGNORECASE,
+)
+
+
+def _is_cellc_intent(text: str) -> bool:
+    return bool(_CELLC_INTENT_RE.search(text or ""))
+
+
+_CELLC_PROMPT_HINT = (
+    "\n\nCellScript (.cell) tooling is available: call cellc_check to verify "
+    "Cell contracts, cellc_language_reference for syntax, and cellc_save (with "
+    "confirmation) to store a checked contract."
+)
+
 _CELLC_MAX_SOURCE = 200_000
 _CELLC_PROFILES = {"ckb"}
 _CELLC_CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
