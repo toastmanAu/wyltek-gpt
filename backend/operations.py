@@ -351,6 +351,34 @@ class OperationRegistry:
         return [op.to_tool_schema() for op in self._enabled]
 
 
+def make_cellc_save_operation() -> Operation:
+    """Synthetic op: write a model-supplied .cell source to the workspace.
+    kind 'cellc_save' is handled specially in /api/operations/run (re-check + write)."""
+    return Operation(
+        id="cellc_save",
+        kind="cellc_save",
+        description=(
+            "Save a checked CellScript contract to the workspace as <name>.cell. "
+            "Only call after cellc_check passes; the backend re-checks and refuses "
+            "to save a failing contract."
+        ),
+        capabilities_required=("text",),
+        params=(
+            Param(
+                name="name",
+                validator=TextValidator(max_len=64, description="File stem (letters, digits, _ or -)."),
+                required=True,
+            ),
+            Param(
+                name="source",
+                validator=TextValidator(max_len=200_000, description="Full .cell source."),
+                required=True,
+            ),
+        ),
+        output_ext="cell",
+    )
+
+
 def make_converter_operation(reachable_targets: tuple[str, ...]) -> Operation:
     """Synthetic operation that wraps the converter registry — gives the
     model access to all 25 user-tray converters through one op call.

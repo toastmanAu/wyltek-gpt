@@ -24,6 +24,7 @@ from backend.host_context import host_context_block
 from backend.operations import (
     Operation,
     OperationRegistry,
+    make_cellc_save_operation,
     make_converter_operation,
     run_local,
     validate_params,
@@ -87,6 +88,8 @@ for _conv in REGISTRY.enabled:
     _REACHABLE_TARGETS.update(_conv.targets)
 if _REACHABLE_TARGETS:
     OPERATIONS.add(make_converter_operation(tuple(sorted(_REACHABLE_TARGETS))))
+if cellc_bridge.available():
+    OPERATIONS.add(make_cellc_save_operation())
 
 log.info("operations: %d enabled, %d disabled", len(OPERATIONS.enabled), len(OPERATIONS.missing))
 
