@@ -60,6 +60,12 @@ def language_reference() -> str:
     return _server.cellc_language_reference()
 
 
+def design_notes() -> str:
+    if _server is None:
+        return ""
+    return _server.cellc_design_notes()
+
+
 def list_examples() -> list[dict]:
     return _server.cellc_list_examples()
 

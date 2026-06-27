@@ -28,3 +28,20 @@ def test_full_system_prompt_no_hint_when_unavailable(monkeypatch):
     # legitimately appears in the cellc_save op description when that op is
     # registered (CELLC_BIN set in the environment).
     assert app_module._CELLC_PROMPT_HINT not in app_module._full_system_prompt()
+
+
+def test_design_notes_injected_on_cellc_intent(monkeypatch):
+    monkeypatch.setattr(app_module.cellc_bridge, "available", lambda: True)
+    # build the system message the way /api/chat does for a cellc-intent message
+    msgs = [{"role": "system", "content": app_module._full_system_prompt()}]
+    app_module._inject_cellc_context(msgs, "write a CellScript token contract")
+    sys = msgs[0]["content"]
+    assert "CellScript design notes" in sys or "Cell-model design rules" in sys
+    assert "lock_args" in sys.lower()
+
+
+def test_design_notes_absent_on_plain_chat(monkeypatch):
+    monkeypatch.setattr(app_module.cellc_bridge, "available", lambda: True)
+    msgs = [{"role": "system", "content": app_module._full_system_prompt()}]
+    app_module._inject_cellc_context(msgs, "what's the weather")
+    assert "Cell-model design rules" not in msgs[0]["content"]
