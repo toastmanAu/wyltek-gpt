@@ -66,3 +66,79 @@ def list_examples() -> list[dict]:
 
 def get_example(name: str) -> dict:
     return _server.cellc_get_example(name=name)
+
+
+import re
+
+MAX_SOURCE = 200_000
+PROFILES = {"ckb"}
+CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+CELLC_TOOL_NAMES = frozenset(
+    {"cellc_check", "cellc_explain", "cellc_get_example", "cellc_language_reference"}
+)
+
+
+def tool_schemas() -> list[dict]:
+    def fn(name, desc, props, required):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {"type": "object", "properties": props, "required": required},
+            },
+        }
+    return [
+        fn("cellc_check",
+           "Type-check a CellScript .cell contract. Returns ok + diagnostics (line/column/code/message).",
+           {"source": {"type": "string", "description": "full .cell source"},
+            "target_profile": {"type": "string", "enum": ["ckb"], "description": "target profile (default ckb)"}},
+           ["source"]),
+        fn("cellc_explain",
+           "Explain a CellScript error code (e.g. E0014) with description and fix hint.",
+           {"code": {"type": "string", "description": "error code or name, e.g. E0014"}},
+           ["code"]),
+        fn("cellc_get_example",
+           "Return a bundled example .cell contract's source by name (e.g. token, nft).",
+           {"name": {"type": "string", "description": "example name"}},
+           ["name"]),
+        fn("cellc_language_reference",
+           "Return the full CellScript language surface (keywords, effects, a worked example).",
+           {}, []),
+    ]
+
+
+def _tool_err(msg: str) -> dict:
+    return {"ok": False, "tool_error": True, "exit_code": -1, "stderr": msg}
+
+
+def dispatch(name: str, arguments: dict) -> dict:
+    arguments = arguments or {}
+    if name == "cellc_check" or name == "cellc_metadata":
+        source = arguments.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return _tool_err("missing or empty 'source'")
+        if len(source) > MAX_SOURCE:
+            return _tool_err(f"source too long ({len(source)} > {MAX_SOURCE})")
+        profile = arguments.get("target_profile", "ckb")
+        if profile not in PROFILES:
+            return _tool_err(f"invalid target_profile {profile!r}")
+        full = bool(arguments.get("full"))
+        if name == "cellc_check":
+            return check(source, target_profile=profile, full=full)
+        return metadata(source, target_profile=profile, full=full)
+    if name == "cellc_explain":
+        code = arguments.get("code")
+        if not isinstance(code, str) or not CODE_RE.match(code):
+            return _tool_err("invalid 'code' (expected an error code/name like E0014)")
+        return explain(code)
+    if name == "cellc_get_example":
+        ex = arguments.get("name")
+        if not isinstance(ex, str) or not NAME_RE.match(ex):
+            return _tool_err("invalid example 'name'")
+        return get_example(ex)
+    if name == "cellc_language_reference":
+        return {"reference": language_reference()}
+    return _tool_err(f"unknown cellc tool {name!r}")
