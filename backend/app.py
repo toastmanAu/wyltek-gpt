@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.bridges import cellc as cellc_bridge
 from backend.bridges import open_palette
 from backend.capabilities import CapabilityCache
 from backend.converters import Registry, run_conversion
@@ -260,6 +261,15 @@ async def list_models():
         raise HTTPException(503, f"Ollama unreachable at {OLLAMA_URL}: {e}")
 
 
+# Sentinel markers wrapping a reasoning model's "thinking" channel inside
+# the text stream. Ollama returns chain-of-thought on a separate `thinking`
+# field; we splice it into the same stream bracketed by these control-char
+# markers so the frontend can render it distinctly and still scan it for
+# code blocks. Control chars won't collide with model prose.
+THINK_OPEN = "THINK"
+THINK_CLOSE = "/THINK"
+
+
 @app.post("/api/chat")
 async def chat(payload: dict):
     """Streaming chat. Forwards Ollama tool definitions when available so
@@ -330,6 +340,9 @@ async def chat(payload: dict):
                     except json.JSONDecodeError:
                         continue
                     msg = data.get("message", {}) or {}
+                    reasoning = msg.get("thinking")
+                    if reasoning:
+                        yield "thinking", reasoning
                     chunk = msg.get("content")
                     if chunk:
                         yield "chunk", chunk
@@ -357,38 +370,55 @@ async def chat(payload: dict):
         # First attempt: with tools. If Ollama rejects (the model doesn't
         # support function-calling), retry without — the structured ``op:``
         # fence parser still works, that's the whole point of the hybrid.
+        # `in_thinking` tracks whether we're inside a reasoning run so we can
+        # bracket it with sentinels; it survives the tools→no-tools retry
+        # because `relay` recurses with the same nonlocal state.
         attempted_fallback = False
-        async for kind, value in _stream_one(body_with_tools):
-            if kind == "chunk":
-                yield value
-            elif kind == "tool_calls":
-                yield "\n" + json.dumps({"__tool_calls__": value})
-            elif kind == "stats":
-                yield "\n" + json.dumps({"__stats__": value})
-            elif kind == "error":
-                err_msg = str(value.get("error", "")).lower()
-                if (not attempted_fallback
-                        and "tools" in err_msg
-                        and OPERATIONS.enabled):
-                    log.info("model %s rejected tools — retrying without", model)
-                    attempted_fallback = True
-                    async for k2, v2 in _stream_one(body_without_tools):
-                        if k2 == "chunk":
-                            yield v2
-                        elif k2 == "tool_calls":
-                            yield "\n" + json.dumps({"__tool_calls__": v2})
-                        elif k2 == "stats":
-                            yield "\n" + json.dumps({"__stats__": v2})
-                        elif k2 == "error":
-                            yield f"\n[backend error: Ollama {v2['status']}: {v2['error']}]"
-                            return
-                        elif k2 == "done":
-                            return
+        in_thinking = False
+
+        async def relay(source):
+            nonlocal attempted_fallback, in_thinking
+            async for kind, value in source:
+                if kind == "thinking":
+                    if not in_thinking:
+                        in_thinking = True
+                        yield THINK_OPEN
+                    yield value
+                elif kind == "chunk":
+                    if in_thinking:
+                        in_thinking = False
+                        yield THINK_CLOSE
+                    yield value
+                elif kind == "tool_calls":
+                    yield "\n" + json.dumps({"__tool_calls__": value})
+                elif kind == "stats":
+                    if in_thinking:
+                        in_thinking = False
+                        yield THINK_CLOSE
+                    yield "\n" + json.dumps({"__stats__": value})
+                elif kind == "error":
+                    err_msg = str(value.get("error", "")).lower()
+                    if (not attempted_fallback
+                            and "tools" in err_msg
+                            and OPERATIONS.enabled):
+                        log.info("model %s rejected tools — retrying without", model)
+                        attempted_fallback = True
+                        async for wire in relay(_stream_one(body_without_tools)):
+                            yield wire
+                        return
+                    if in_thinking:
+                        in_thinking = False
+                        yield THINK_CLOSE
+                    yield f"\n[backend error: Ollama {value['status']}: {value['error']}]"
                     return
-                yield f"\n[backend error: Ollama {value['status']}: {value['error']}]"
-                return
-            elif kind == "done":
-                return
+                elif kind == "done":
+                    if in_thinking:
+                        in_thinking = False
+                        yield THINK_CLOSE
+                    return
+
+        async for wire in relay(_stream_one(body_with_tools)):
+            yield wire
 
     return StreamingResponse(stream(), media_type="text/plain")
 
@@ -697,6 +727,97 @@ async def _run_bridge_op(
         )
     except open_palette.BridgeUnavailable as e:
         raise HTTPException(502, str(e))
+
+
+# ─── cellc (CellScript) endpoints — read-only, no workspace files ─────
+# Dedicated like /api/operations/translate (cellc returns DATA, not a
+# file, so it does not fit the file-producing OPERATIONS registry).
+
+# `re` and `asyncio` are already imported at the top of backend/app.py
+# (lines 3 and 8) — use them directly; do NOT add duplicate imports.
+_CELLC_MAX_SOURCE = 200_000
+_CELLC_PROFILES = {"ckb"}
+_CELLC_CODE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_CELLC_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _cellc_require_available() -> None:
+    if not cellc_bridge.available():
+        raise HTTPException(
+            503, "cellc not available — build it and set CELLC_BIN "
+                 "(cd ~/CellScript && cargo build --release -p cellscript --bin cellc)"
+        )
+
+
+def _cellc_validate_source(payload: dict) -> str:
+    source = payload.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise HTTPException(400, "missing or empty 'source'")
+    if len(source) > _CELLC_MAX_SOURCE:
+        raise HTTPException(413, f"source too long ({len(source)} > {_CELLC_MAX_SOURCE})")
+    return source
+
+
+def _cellc_validate_profile(payload: dict) -> str:
+    profile = payload.get("target_profile", "ckb")
+    if profile not in _CELLC_PROFILES:
+        raise HTTPException(400, f"invalid target_profile {profile!r}; allowed: {sorted(_CELLC_PROFILES)}")
+    return profile
+
+
+@app.get("/api/cellc/status")
+async def cellc_status():
+    return cellc_bridge.status()
+
+
+@app.post("/api/cellc/check")
+async def cellc_check_endpoint(payload: dict):
+    _cellc_require_available()
+    source = _cellc_validate_source(payload)
+    profile = _cellc_validate_profile(payload)
+    full = bool(payload.get("full"))
+    return await asyncio.to_thread(cellc_bridge.check, source=source, target_profile=profile, full=full)
+
+
+@app.post("/api/cellc/metadata")
+async def cellc_metadata_endpoint(payload: dict):
+    _cellc_require_available()
+    source = _cellc_validate_source(payload)
+    profile = _cellc_validate_profile(payload)
+    full = bool(payload.get("full"))
+    return await asyncio.to_thread(cellc_bridge.metadata, source=source, target_profile=profile, full=full)
+
+
+@app.post("/api/cellc/explain")
+async def cellc_explain_endpoint(payload: dict):
+    _cellc_require_available()
+    code = payload.get("code")
+    if not isinstance(code, str) or not _CELLC_CODE_RE.match(code):
+        raise HTTPException(400, "invalid 'code' (expected an error code/name like E0014)")
+    return await asyncio.to_thread(cellc_bridge.explain, code=code)
+
+
+@app.get("/api/cellc/reference")
+async def cellc_reference_endpoint():
+    _cellc_require_available()
+    return {"reference": cellc_bridge.language_reference()}
+
+
+@app.get("/api/cellc/examples")
+async def cellc_examples_endpoint():
+    _cellc_require_available()
+    return {"examples": cellc_bridge.list_examples()}
+
+
+@app.get("/api/cellc/example/{name}")
+async def cellc_example_endpoint(name: str):
+    _cellc_require_available()
+    if not _CELLC_NAME_RE.match(name):
+        raise HTTPException(400, "invalid example name")
+    result = cellc_bridge.get_example(name)
+    if result.get("tool_error"):
+        raise HTTPException(404, result.get("stderr", "example not found"))
+    return result
 
 
 # ─── Workspace helpers + uploads + downloads ──────────────────────────
