@@ -42,6 +42,16 @@ OLLAMA_URL = CONFIG["ollama"]["url"]
 STORAGE = CONFIG.get("storage") or {}
 WORKSPACE = ROOT / STORAGE.get("workspace", "workspaces")
 WORKSPACE.mkdir(exist_ok=True)
+_DROP_RAW = STORAGE.get("dropbox", "dropbox")
+DROPBOX = Path(os.path.expanduser(_DROP_RAW))
+if not DROPBOX.is_absolute():
+    DROPBOX = ROOT / DROPBOX
+DROPBOX = DROPBOX.resolve()
+try:
+    DROPBOX.mkdir(parents=True, exist_ok=True)
+    log.info("drop folder: %s", DROPBOX)
+except OSError as exc:
+    log.warning("drop folder unavailable (%s): %s", DROPBOX, exc)
 _OUT_RAW = STORAGE.get("output_dir")
 OUTPUT_DIR: Path | None = (
     Path(os.path.expanduser(_OUT_RAW)).resolve() if _OUT_RAW else None
@@ -983,6 +993,28 @@ def _resolve_in_workspace(session_id: str, name: str) -> tuple[Path, Path]:
     except ValueError:
         raise HTTPException(400, "invalid path")
     return session_dir, target
+
+
+def _resolve_in_dropbox(name: str) -> Path:
+    """Resolve a basename inside the drop root; reject anything that escapes it."""
+    target = (DROPBOX / Path(name).name).resolve()
+    if target.parent != DROPBOX:
+        raise HTTPException(400, "invalid path")
+    return target
+
+
+@app.get("/api/dropbox")
+async def dropbox_list():
+    if not DROPBOX.exists():
+        return {"files": []}
+    entries = []
+    for p in DROPBOX.iterdir():
+        if p.name.startswith(".") or not p.is_file():
+            continue
+        st = p.stat()
+        entries.append({"name": p.name, "size": st.st_size, "modified": st.st_mtime})
+    entries.sort(key=lambda e: e["modified"], reverse=True)
+    return {"files": entries}
 
 
 @app.post("/api/upload")
