@@ -28,6 +28,7 @@
       <select id="model" aria-label="Model"><option>loading...</option></select>
       <label class="upload-btn" for="file" title="Upload file">+ file</label>
       <input type="file" id="file" hidden />
+      <button id="drop-btn" class="upload-btn" type="button" title="Drop folder">📂 drop</button>
     </header>
 
     <section id="tray" class="tray hidden" aria-label="Pending file">
@@ -39,6 +40,23 @@
       </div>
       <div id="tray-params" class="tray-params"></div>
     </section>
+
+    <div id="drop-backdrop" class="settings-backdrop hidden"></div>
+    <aside id="drop-panel" class="settings hidden" aria-hidden="true" aria-label="Drop folder">
+      <header class="settings-head">
+        <span>drop folder</span>
+        <div class="drop-head-actions">
+          <button id="drop-refresh" type="button" class="ghost" title="Refresh">⟳</button>
+          <button id="drop-close" type="button" class="ghost" aria-label="Close">×</button>
+        </div>
+      </header>
+      <div class="settings-body">
+        <ul id="drop-list" class="drop-list"></ul>
+      </div>
+      <footer class="drop-foot">
+        <button id="drop-add" type="button" class="settings-btn" disabled>Add to chat</button>
+      </footer>
+    </aside>
 
     <section id="messages" class="messages" aria-live="polite"></section>
 
