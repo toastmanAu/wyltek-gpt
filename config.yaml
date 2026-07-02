@@ -43,6 +43,7 @@ skills:
 storage:
   workspace: workspaces
   output_dir: ~/Downloads/wyltek-gpt-output
+  dropbox: dropbox
 
 # ──────────────────────────────────────────────────────────────────
 # Auto-router — specialised request paths that bypass the selected

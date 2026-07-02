@@ -531,3 +531,15 @@ body {
   .upload-btn { padding: 0.25rem 0.5rem; }
   .op-card .op-row { grid-template-columns: 1fr; gap: 0.15rem; }
 }
+
+.drop-head-actions { display: flex; gap: 0.25rem; }
+.drop-list { list-style: none; margin: 0; padding: 0; }
+.drop-list li {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.4rem 0.2rem; border-bottom: 1px solid var(--border, #333);
+}
+.drop-list li label { display: flex; align-items: center; gap: 0.5rem; flex: 1; cursor: pointer; }
+.drop-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop-meta { opacity: 0.6; font-size: 0.85em; white-space: nowrap; }
+.drop-empty { opacity: 0.6; padding: 1rem 0.2rem; }
+.drop-foot { padding: 0.6rem; border-top: 1px solid var(--border, #333); text-align: right; }

@@ -7,6 +7,7 @@ venv/
 
 # App data — workspaces are user files, never publish
 workspaces/
+dropbox/
 data/*.sqlite
 
 # Claude Code session state

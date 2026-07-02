@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -42,6 +43,20 @@ OLLAMA_URL = CONFIG["ollama"]["url"]
 STORAGE = CONFIG.get("storage") or {}
 WORKSPACE = ROOT / STORAGE.get("workspace", "workspaces")
 WORKSPACE.mkdir(exist_ok=True)
+def _resolve_dropbox_path(raw: str | None, root: Path) -> Path:
+    """Resolve the drop-folder path; empty/null falls back to the default."""
+    path = Path(os.path.expanduser(raw or "dropbox"))
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+DROPBOX = _resolve_dropbox_path(STORAGE.get("dropbox"), ROOT)
+try:
+    DROPBOX.mkdir(parents=True, exist_ok=True)
+    log.info("drop folder: %s", DROPBOX)
+except OSError as exc:
+    log.warning("drop folder unavailable (%s): %s", DROPBOX, exc)
 _OUT_RAW = STORAGE.get("output_dir")
 OUTPUT_DIR: Path | None = (
     Path(os.path.expanduser(_OUT_RAW)).resolve() if _OUT_RAW else None
@@ -983,6 +998,60 @@ def _resolve_in_workspace(session_id: str, name: str) -> tuple[Path, Path]:
     except ValueError:
         raise HTTPException(400, "invalid path")
     return session_dir, target
+
+
+def _resolve_in_dropbox(name: str) -> Path:
+    """Resolve a basename inside the drop root; reject anything that escapes it."""
+    target = (DROPBOX / Path(name).name).resolve()
+    if target.parent != DROPBOX:
+        raise HTTPException(400, "invalid path")
+    return target
+
+
+@app.get("/api/dropbox")
+async def dropbox_list():
+    if not DROPBOX.exists():
+        return {"files": []}
+    entries = []
+    for p in DROPBOX.iterdir():
+        if p.name.startswith(".") or not p.is_file():
+            continue
+        st = p.stat()
+        entries.append({"name": p.name, "size": st.st_size, "modified": st.st_mtime})
+    entries.sort(key=lambda e: e["modified"], reverse=True)
+    return {"files": entries}
+
+
+@app.post("/api/dropbox/import")
+async def dropbox_import(payload: dict):
+    session_id = payload.get("session_id", "default")
+    names = payload.get("names") or []
+    if not isinstance(names, list):
+        raise HTTPException(400, "'names' must be a list")
+
+    session_dir, _ = _resolve_in_workspace(session_id, "_")
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    imported: list[dict] = []
+    skipped: list[dict] = []
+    for name in names:
+        try:
+            src = _resolve_in_dropbox(str(name))
+        except HTTPException:
+            skipped.append({"name": name, "reason": "invalid name"})
+            continue
+        if not src.is_file():
+            skipped.append({"name": name, "reason": "not found"})
+            continue
+        _, dest = _resolve_in_workspace(session_id, src.name)
+        try:
+            shutil.copy(src, dest)
+            imported.append({"name": dest.name, "size": dest.stat().st_size})
+        except OSError:
+            skipped.append({"name": name, "reason": "copy failed"})
+            continue
+
+    return {"imported": imported, "skipped": skipped}
 
 
 @app.post("/api/upload")
