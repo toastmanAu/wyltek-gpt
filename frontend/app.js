@@ -585,6 +585,126 @@ fileInput.addEventListener("change", async () => {
   }
 });
 
+// ─── Drop folder panel ────────────────────────────────────────────
+const dropBtn = $("#drop-btn");
+const dropPanel = $("#drop-panel");
+const dropBackdrop = $("#drop-backdrop");
+const dropList = $("#drop-list");
+const dropAdd = $("#drop-add");
+
+function dropRelTime(epochSeconds) {
+  const secs = Math.max(0, Date.now() / 1000 - epochSeconds);
+  const units = [[86400, "d"], [3600, "h"], [60, "m"]];
+  for (const [size, label] of units) {
+    if (secs >= size) return `${Math.floor(secs / size)}${label} ago`;
+  }
+  return "just now";
+}
+
+function dropCheckedNames() {
+  return [...dropList.querySelectorAll("input[type=checkbox]:checked")].map(
+    (c) => c.value,
+  );
+}
+
+function dropSyncAddState() {
+  dropAdd.disabled = dropCheckedNames().length === 0;
+}
+
+async function dropRefresh() {
+  dropList.innerHTML = "<li class='drop-empty'>loading...</li>";
+  try {
+    const r = await fetch("/api/dropbox");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const files = (await r.json()).files || [];
+    if (files.length === 0) {
+      dropList.innerHTML =
+        "<li class='drop-empty'>Drop folder is empty — add files to it and refresh.</li>";
+      dropSyncAddState();
+      return;
+    }
+    dropList.innerHTML = "";
+    for (const f of files) {
+      const li = document.createElement("li");
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = f.name;
+      cb.addEventListener("change", dropSyncAddState);
+      const name = document.createElement("span");
+      name.className = "drop-name";
+      name.textContent = f.name;
+      const meta = document.createElement("span");
+      meta.className = "drop-meta";
+      meta.textContent = `${formatBytes(f.size)} · ${dropRelTime(f.modified)}`;
+      label.append(cb, name, meta);
+      li.append(label);
+      dropList.append(li);
+    }
+  } catch (e) {
+    dropList.innerHTML = `<li class='drop-empty'>failed to load: ${e.message}</li>`;
+  }
+  dropSyncAddState();
+}
+
+function openDropPanel() {
+  dropPanel.classList.remove("hidden");
+  dropBackdrop.classList.remove("hidden");
+  dropPanel.setAttribute("aria-hidden", "false");
+  dropRefresh();
+}
+
+function closeDropPanel() {
+  dropPanel.classList.add("hidden");
+  dropBackdrop.classList.add("hidden");
+  dropPanel.setAttribute("aria-hidden", "true");
+}
+
+// Reuse the upload registration path so the model learns each imported file.
+function registerImportedFile(meta) {
+  appendDownload(
+    "system",
+    `added from drop folder (${formatBytes(meta.size)}):`,
+    meta.name,
+    `/api/files/${SESSION}/${encodeURIComponent(meta.name)}`,
+  );
+  history.push({
+    role: "system",
+    content: `User added file "${meta.name}" (${formatBytes(meta.size)}) from the drop folder — available in the workspace as "${meta.name}". When the user asks you to process, convert, edit, or modify this file, use one of the available operations with "${meta.name}" as the source.`,
+  });
+}
+
+dropBtn.addEventListener("click", openDropPanel);
+$("#drop-close").addEventListener("click", closeDropPanel);
+dropBackdrop.addEventListener("click", closeDropPanel);
+$("#drop-refresh").addEventListener("click", dropRefresh);
+
+dropAdd.addEventListener("click", async () => {
+  const names = dropCheckedNames();
+  if (names.length === 0) return;
+  dropAdd.disabled = true;
+  try {
+    const r = await fetch("/api/dropbox/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: SESSION, names }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    for (const meta of body.imported) registerImportedFile(meta);
+    if (body.imported.length === 1) {
+      showTray({ ...body.imported[0], session_id: SESSION });
+    }
+    for (const s of body.skipped) {
+      appendMsg("system", `could not add "${s.name}": ${s.reason}`);
+    }
+    closeDropPanel();
+  } catch (e) {
+    appendMsg("system", `drop import failed: ${e.message}`);
+    dropAdd.disabled = false;
+  }
+});
+
 trayClear.addEventListener("click", hideTray);
 
 trayConvert.addEventListener("click", async () => {
