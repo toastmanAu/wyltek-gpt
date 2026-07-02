@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1015,6 +1016,34 @@ async def dropbox_list():
         entries.append({"name": p.name, "size": st.st_size, "modified": st.st_mtime})
     entries.sort(key=lambda e: e["modified"], reverse=True)
     return {"files": entries}
+
+
+@app.post("/api/dropbox/import")
+async def dropbox_import(payload: dict):
+    session_id = payload.get("session_id", "default")
+    names = payload.get("names") or []
+    if not isinstance(names, list):
+        raise HTTPException(400, "'names' must be a list")
+
+    session_dir, _ = _resolve_in_workspace(session_id, "_")
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    imported: list[dict] = []
+    skipped: list[dict] = []
+    for name in names:
+        try:
+            src = _resolve_in_dropbox(str(name))
+        except HTTPException:
+            skipped.append({"name": name, "reason": "invalid name"})
+            continue
+        if not src.is_file():
+            skipped.append({"name": name, "reason": "not found"})
+            continue
+        _, dest = _resolve_in_workspace(session_id, src.name)
+        shutil.copy(src, dest)
+        imported.append({"name": dest.name, "size": dest.stat().st_size})
+
+    return {"imported": imported, "skipped": skipped}
 
 
 @app.post("/api/upload")

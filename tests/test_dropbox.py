@@ -56,3 +56,75 @@ def test_list_missing_folder_is_empty(tmp_path, monkeypatch):
     r = client.get("/api/dropbox")
     assert r.status_code == 200
     assert r.json() == {"files": []}
+
+
+# ── POST /api/dropbox/import ─────────────────────────────────────────
+
+
+def _point_both(tmp_path, monkeypatch):
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setattr(app_module, "DROPBOX", drop.resolve())
+    monkeypatch.setattr(app_module, "WORKSPACE", ws.resolve())
+    return drop, ws
+
+
+def test_import_copies_multiple_into_session_workspace(tmp_path, monkeypatch):
+    drop, ws = _point_both(tmp_path, monkeypatch)
+    (drop / "a.txt").write_text("AAA")
+    (drop / "b.txt").write_text("BB")
+
+    r = client.post(
+        "/api/dropbox/import",
+        json={"session_id": "s1", "names": ["a.txt", "b.txt"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert {f["name"] for f in body["imported"]} == {"a.txt", "b.txt"}
+    assert body["skipped"] == []
+    assert (ws / "s1" / "a.txt").read_text() == "AAA"
+    assert (ws / "s1" / "b.txt").read_text() == "BB"
+
+
+def test_import_traversal_name_is_skipped_not_written(tmp_path, monkeypatch):
+    drop, ws = _point_both(tmp_path, monkeypatch)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP")
+
+    r = client.post(
+        "/api/dropbox/import",
+        json={"session_id": "s1", "names": ["../secret.txt"]},
+    )
+    assert r.status_code == 200
+    # basename "secret.txt" does not exist in the drop folder -> skipped
+    assert r.json()["imported"] == []
+    assert r.json()["skipped"][0]["name"] == "../secret.txt"
+    assert not (ws / "s1" / "secret.txt").exists()
+
+
+def test_import_nonexistent_name_is_skipped_not_500(tmp_path, monkeypatch):
+    _point_both(tmp_path, monkeypatch)
+    r = client.post(
+        "/api/dropbox/import",
+        json={"session_id": "s1", "names": ["ghost.txt"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["imported"] == []
+    assert r.json()["skipped"] == [{"name": "ghost.txt", "reason": "not found"}]
+
+
+def test_import_collision_overwrites(tmp_path, monkeypatch):
+    drop, ws = _point_both(tmp_path, monkeypatch)
+    (drop / "dup.txt").write_text("NEW")
+    sess = ws / "s1"
+    sess.mkdir()
+    (sess / "dup.txt").write_text("OLD")
+
+    r = client.post(
+        "/api/dropbox/import",
+        json={"session_id": "s1", "names": ["dup.txt"]},
+    )
+    assert r.status_code == 200
+    assert (sess / "dup.txt").read_text() == "NEW"
