@@ -8,6 +8,7 @@ path-traversal escape.
 
 import os
 import shutil
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -155,3 +156,15 @@ def test_import_copy_failure_is_skipped_not_500(tmp_path, monkeypatch):
     assert {f["name"] for f in body["imported"]} == {"good.txt"}
     assert (ws / "s1" / "good.txt").read_text() == "GOOD"
     assert not (ws / "s1" / "bad.txt").exists()
+
+
+# ── _resolve_dropbox_path (config-resolution helper) ─────────────────
+
+
+def test_resolve_dropbox_path_handles_null_and_empty(tmp_path):
+    # null/empty fall back to the default "dropbox" under root
+    assert app_module._resolve_dropbox_path(None, tmp_path) == (tmp_path / "dropbox").resolve()
+    assert app_module._resolve_dropbox_path("", tmp_path) == (tmp_path / "dropbox").resolve()
+    # relative name resolves under root; absolute is respected
+    assert app_module._resolve_dropbox_path("drop", tmp_path) == (tmp_path / "drop").resolve()
+    assert app_module._resolve_dropbox_path("/tmp/xyz-drop", tmp_path) == Path("/tmp/xyz-drop").resolve()

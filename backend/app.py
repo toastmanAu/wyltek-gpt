@@ -43,11 +43,15 @@ OLLAMA_URL = CONFIG["ollama"]["url"]
 STORAGE = CONFIG.get("storage") or {}
 WORKSPACE = ROOT / STORAGE.get("workspace", "workspaces")
 WORKSPACE.mkdir(exist_ok=True)
-_DROP_RAW = STORAGE.get("dropbox", "dropbox")
-DROPBOX = Path(os.path.expanduser(_DROP_RAW))
-if not DROPBOX.is_absolute():
-    DROPBOX = ROOT / DROPBOX
-DROPBOX = DROPBOX.resolve()
+def _resolve_dropbox_path(raw: str | None, root: Path) -> Path:
+    """Resolve the drop-folder path; empty/null falls back to the default."""
+    path = Path(os.path.expanduser(raw or "dropbox"))
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+DROPBOX = _resolve_dropbox_path(STORAGE.get("dropbox"), ROOT)
 try:
     DROPBOX.mkdir(parents=True, exist_ok=True)
     log.info("drop folder: %s", DROPBOX)
