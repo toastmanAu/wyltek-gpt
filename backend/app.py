@@ -1040,8 +1040,12 @@ async def dropbox_import(payload: dict):
             skipped.append({"name": name, "reason": "not found"})
             continue
         _, dest = _resolve_in_workspace(session_id, src.name)
-        shutil.copy(src, dest)
-        imported.append({"name": dest.name, "size": dest.stat().st_size})
+        try:
+            shutil.copy(src, dest)
+            imported.append({"name": dest.name, "size": dest.stat().st_size})
+        except OSError:
+            skipped.append({"name": name, "reason": "copy failed"})
+            continue
 
     return {"imported": imported, "skipped": skipped}
 

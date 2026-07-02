@@ -7,6 +7,7 @@ path-traversal escape.
 """
 
 import os
+import shutil
 
 from fastapi.testclient import TestClient
 
@@ -128,3 +129,29 @@ def test_import_collision_overwrites(tmp_path, monkeypatch):
     )
     assert r.status_code == 200
     assert (sess / "dup.txt").read_text() == "NEW"
+
+
+def test_import_copy_failure_is_skipped_not_500(tmp_path, monkeypatch):
+    drop, ws = _point_both(tmp_path, monkeypatch)
+    (drop / "bad.txt").write_text("BAD")
+    (drop / "good.txt").write_text("GOOD")
+
+    real_copy = shutil.copy
+
+    def flaky_copy(src, dest):
+        if os.path.basename(str(src)) == "bad.txt":
+            raise OSError("simulated disk failure")
+        return real_copy(src, dest)
+
+    monkeypatch.setattr(app_module.shutil, "copy", flaky_copy)
+
+    r = client.post(
+        "/api/dropbox/import",
+        json={"session_id": "s1", "names": ["bad.txt", "good.txt"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["skipped"] == [{"name": "bad.txt", "reason": "copy failed"}]
+    assert {f["name"] for f in body["imported"]} == {"good.txt"}
+    assert (ws / "s1" / "good.txt").read_text() == "GOOD"
+    assert not (ws / "s1" / "bad.txt").exists()
