@@ -18,6 +18,8 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _slugify(name: str) -> str:
+    if not isinstance(name, str):
+        name = ""
     s = _SLUG_RE.sub("-", (name or "demo").lower()).strip("-")
     return s or "demo"
 

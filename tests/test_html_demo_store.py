@@ -86,3 +86,9 @@ def test_apply_patch_non_dict_edit_fails_gracefully(tmp_path):
     did = s.create("<h1>hi</h1>")
     ok, reason = s.apply_patch(did, ["not a dict"])
     assert ok is False and "object" in reason
+
+
+def test_slugify_non_string_returns_demo():
+    assert _slugify(12345) == "demo"
+    assert _slugify(None) == "demo"
+    assert _slugify(["x"]) == "demo"

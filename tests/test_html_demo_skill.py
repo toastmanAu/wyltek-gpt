@@ -50,3 +50,16 @@ def test_dispatch_preview_creates_and_renders():
     assert isinstance(r["demo_id"], str)
     # screenshot suppressed unless caller opts in
     assert r.get("_screenshot_b64") is None
+
+
+def test_dispatch_bad_settle_ms_does_not_raise():
+    did = html_demo.store().create("<html>S</html>", "demo")
+    r = html_demo.dispatch("save_demo", {"demo_id": did, "settle_ms": "not-a-number"})
+    assert r.get("saved") is True  # save_demo ignores settle_ms; must not raise
+
+
+def test_dispatch_non_string_name_does_not_raise():
+    did = html_demo.store().create("<html>S</html>", "demo")
+    r = html_demo.dispatch("save_demo", {"demo_id": did, "name": 12345})
+    assert r.get("saved") is True
+    assert r["preview_url"].startswith("/demos/")

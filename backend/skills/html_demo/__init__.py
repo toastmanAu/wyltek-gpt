@@ -95,7 +95,10 @@ def _err(msg: str) -> dict:
 def dispatch(name: str, arguments: dict) -> dict:
     arguments = arguments or {}
     st = store()
-    settle = int(arguments.get("settle_ms", 700) or 700)
+    try:
+        settle = int(arguments.get("settle_ms", 700) or 700)
+    except (TypeError, ValueError):
+        settle = 700
     want_shot = bool(arguments.get("_want_screenshot"))
     interactions = arguments.get("interactions")
 
