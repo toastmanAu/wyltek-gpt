@@ -31,3 +31,24 @@ def test_load_context_unknown_session_raises(tmp_path):
     s = _store(tmp_path)
     with pytest.raises(SessionStoreError):
         s.load_context("nope")
+
+
+def test_list_get_full_rename_delete(tmp_path):
+    s = _store(tmp_path)
+    a = s.create_session(model="m1", title="first")
+    b = s.create_session(model="m2", title="second")
+    s.append_message(b, "user", "q")          # bump b.updated so it sorts first
+    listed = s.list_sessions()
+    assert [x["id"] for x in listed] == [b, a]
+    assert listed[0]["title"] == "second" and listed[0]["model"] == "m2"
+
+    full = s.get_full(a)
+    assert full == {"title": "first", "summary": None, "messages": []}
+    assert s.get_full("nope") is None
+
+    s.rename(a, "renamed")
+    assert s.get_full(a)["title"] == "renamed"
+
+    s.delete(b)
+    assert s.get_full(b) is None
+    assert [x["id"] for x in s.list_sessions()] == [a]

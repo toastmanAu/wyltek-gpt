@@ -108,3 +108,36 @@ class SessionStore:
                         "content": f"[Summary of earlier conversation]\n{srow['summary']}"})
         out.extend({"role": r["role"], "content": r["content"]} for r in rows)
         return out
+
+    def list_sessions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, title, updated, model FROM sessions ORDER BY updated DESC"
+            ).fetchall()
+        return [{"id": r["id"], "title": r["title"], "updated": r["updated"],
+                 "model": r["model"]} for r in rows]
+
+    def get_full(self, session_id: str) -> dict | None:
+        with self._lock:
+            srow = self._conn.execute(
+                "SELECT title, summary FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if srow is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT seq, role, content FROM messages WHERE session_id = ? ORDER BY seq",
+                (session_id,)).fetchall()
+        return {"title": srow["title"], "summary": srow["summary"],
+                "messages": [{"seq": r["seq"], "role": r["role"], "content": r["content"]}
+                             for r in rows]}
+
+    def rename(self, session_id: str, title: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE sessions SET title = ?, updated = ? WHERE id = ?",
+                               (title, time.time(), session_id))
+            self._conn.commit()
+
+    def delete(self, session_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._conn.commit()
