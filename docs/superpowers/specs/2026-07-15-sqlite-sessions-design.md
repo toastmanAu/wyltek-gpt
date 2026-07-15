@@ -161,3 +161,12 @@ Follows the "never block on the feature" pattern already used by `html_demo`, co
 - **Assistant-content accumulation** must capture exactly the visible text the model produced (post-thinking, post-tool-loop). The `relay()` generator already distinguishes `thinking`/`chunk`/tool events, so accumulation hooks the `chunk` path only. Verify the accumulation matches what the frontend renders.
 - **Lazy session creation** on first send must be race-free on the single worker (create-then-append in one store call path).
 - Frontend migration is intentionally omitted; if users have long localStorage chats they care about, a one-shot import is a later, separate nicety.
+
+## Known limitations (Phase 1, accepted)
+
+These are deliberate Phase-1 tradeoffs surfaced during the whole-branch review, documented so Phase 2 inherits them explicitly rather than by surprise:
+
+- **History split-brain on mid-conversation store failure.** In session mode the client sends only the new user turn; the server loads prior history. If a turn's persistence fails (a transient `sqlite3` error caught and logged, or the assistant append failing after the stream), the server transcript diverges from what the browser shows. Chat keeps working (never breaks), but a reload can silently drop the un-persisted turn. Acceptable for a single-user local app; a stronger fix (reconcile on resume, or re-post full history on a signalled failure) is deferred.
+- **No per-session ownership / auth.** Sessions and the store are global and unscoped. Fine for the single-user local deployment, but since "cross-device continuity" is a goal, the DB may become reachable from other LAN devices — any client can list/open/delete any session. Add scoping if multi-user ever matters.
+- **Phase-2 trap — double system message.** `SUMMARY_ROLE = "system"` and `app.py` unconditionally prepends its own system prompt, so once Phase 2 sets a summary, `load_context` yields two back-to-back `system` messages. Inert in Phase 1 (summary always NULL); Phase 2 must use a non-system role or dedupe (marked with a comment at `backend/sessions.py`).
+- **Synchronous SQLite on the event loop.** `SESSIONS.*` calls run directly in the async handlers (not via `asyncio.to_thread`), briefly blocking the loop. Negligible at single-user scale; revisit if concurrency grows.
