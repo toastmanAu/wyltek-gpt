@@ -32,6 +32,7 @@ from backend.operations import (
     validate_params,
 )
 from backend.output_copy import copy_to_output
+from backend.sessions import SessionStore, SessionStoreError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("local-chatbot")
@@ -78,6 +79,15 @@ try:
              DEMOS_DIR, "available" if html_demo.available() else "unavailable")
 except Exception as exc:  # never block boot on the demo feature
     log.warning("html_demo init failed: %s", exc)
+
+# ─── Sessions store (server-side history) ────────────────────────────
+SESSIONS: SessionStore | None = None
+try:
+    SESSIONS = SessionStore(ROOT / "data" / "sessions.db")
+    log.info("sessions store: %s", ROOT / "data" / "sessions.db")
+except Exception as exc:  # never block boot on the feature
+    log.warning("sessions store init failed: %s", exc)
+    SESSIONS = None
 
 # ─── Converter registry (existing) ───────────────────────────────────
 REGISTRY = Registry(CONFIG.get("converters", []))
@@ -676,6 +686,49 @@ async def probe_all_known():
         CAPABILITIES._cache = {}
         CAPABILITIES._save()
     return await CAPABILITIES.probe_models(names)
+
+
+# ─── Sessions API ────────────────────────────────────────────────────
+
+@app.post("/api/sessions")
+async def create_session(payload: dict):
+    if SESSIONS is None:
+        raise HTTPException(503, "sessions store unavailable")
+    model = payload.get("model") or ""
+    sid = SESSIONS.create_session(model=model, title=payload.get("title"))
+    return {"id": sid}
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    if SESSIONS is None:
+        return []
+    return SESSIONS.list_sessions()
+
+
+@app.get("/api/sessions/{sid}")
+async def get_session(sid: str):
+    if SESSIONS is None:
+        raise HTTPException(503, "sessions store unavailable")
+    full = SESSIONS.get_full(sid)
+    if full is None:
+        raise HTTPException(404, "session not found")
+    return full
+
+
+@app.patch("/api/sessions/{sid}")
+async def rename_session(sid: str, payload: dict):
+    if SESSIONS is None or SESSIONS.get_full(sid) is None:
+        raise HTTPException(404, "session not found")
+    SESSIONS.rename(sid, payload.get("title") or "")
+    return {"ok": True}
+
+
+@app.delete("/api/sessions/{sid}")
+async def delete_session(sid: str):
+    if SESSIONS is not None:
+        SESSIONS.delete(sid)
+    return {"ok": True}
 
 
 @app.post("/api/operations/enhance")
