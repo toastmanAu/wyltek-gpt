@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.bridges import cellc as cellc_bridge
 from backend.bridges import open_palette
 from backend.capabilities import CapabilityCache
+from backend.skills import html_demo
 from backend.converters import Registry, run_conversion
 from backend.enhance import enhance_prompt
 from backend.host_context import host_context_block
@@ -68,6 +69,15 @@ if OUTPUT_DIR is not None:
     except OSError as exc:
         log.warning("output mirror unavailable (%s): %s", OUTPUT_DIR, exc)
         OUTPUT_DIR = None
+
+DEMOS_DIR = ROOT / "demos"
+try:
+    DEMOS_DIR.mkdir(parents=True, exist_ok=True)
+    html_demo.init_store(DEMOS_DIR)
+    log.info("html_demo store: %s (render %s)",
+             DEMOS_DIR, "available" if html_demo.available() else "unavailable")
+except Exception as exc:  # never block boot on the demo feature
+    log.warning("html_demo init failed: %s", exc)
 
 # ─── Converter registry (existing) ───────────────────────────────────
 REGISTRY = Registry(CONFIG.get("converters", []))
@@ -188,6 +198,8 @@ def _full_system_prompt() -> str:
     )
     if cellc_bridge.available():
         base = base + _CELLC_PROMPT_HINT
+    if html_demo.available():
+        base = base + _HTMLDEMO_PROMPT_HINT
     return base
 
 
@@ -305,6 +317,7 @@ THINK_OPEN = "THINK"
 THINK_CLOSE = "/THINK"
 
 MAX_CELLC_ITERS = 5
+MAX_HTMLDEMO_ITERS = 4
 
 
 async def _stream_one(body: dict):
@@ -360,13 +373,18 @@ async def _stream_one(body: dict):
             yield "done", None
 
 
-def _partition_cellc_calls(tool_calls):
-    """Split a tool_calls list into (cellc_calls, op_calls)."""
-    cellc_calls, op_calls = [], []
+def _partition_tool_calls(tool_calls):
+    """Split a tool_calls list into (cellc_calls, demo_calls, op_calls)."""
+    cellc_calls, demo_calls, op_calls = [], [], []
     for tc in tool_calls or []:
         name = (tc.get("function") or {}).get("name")
-        (cellc_calls if name in cellc_bridge.CELLC_TOOL_NAMES else op_calls).append(tc)
-    return cellc_calls, op_calls
+        if name in cellc_bridge.CELLC_TOOL_NAMES:
+            cellc_calls.append(tc)
+        elif name in html_demo.HTML_DEMO_TOOL_NAMES:
+            demo_calls.append(tc)
+        else:
+            op_calls.append(tc)
+    return cellc_calls, demo_calls, op_calls
 
 
 def _summarize_cellc_step(name, result):
@@ -418,6 +436,12 @@ async def chat(payload: dict):
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
         cellc_chat = _inject_cellc_context(messages, last_user)
 
+    html_demo_chat = False
+    if html_demo.available():
+        last_user = next((m.get("content", "") for m in reversed(incoming)
+                          if m.get("role") == "user"), "")
+        html_demo_chat = _inject_html_demo_context(messages, last_user)
+
     if text_files:
         injected = _inject_text_files(messages, session_id, text_files)
         if injected:
@@ -445,10 +469,14 @@ async def chat(payload: dict):
     tools = OPERATIONS.tool_schemas() if OPERATIONS.enabled else []
     if cellc_bridge.available():
         tools = tools + cellc_bridge.tool_schemas()
+    if html_demo.available():
+        tools = tools + html_demo.tool_schemas()
     # Ollama defaults num_ctx to ~4096 regardless of the model's real window,
     # which truncates multi-turn agentic loops (system prompt + tool results +
     # the model's own reasoning). Give the loop room; caller may override.
     _options = {"num_ctx": int(payload.get("num_ctx") or _CHAT_DEFAULT_NUM_CTX)}
+    _caps = CAPABILITIES.get(model) or {}
+    _is_vision = bool(_caps.get("vision"))
     body_with_tools: dict = {"model": model, "messages": messages, "stream": True, "options": _options}
     if tools:
         body_with_tools["tools"] = tools
@@ -489,9 +517,47 @@ async def chat(payload: dict):
                         yield THINK_CLOSE
                     yield value
                 elif kind == "tool_calls":
-                    cellc_calls, op_calls = _partition_cellc_calls(value)
+                    cellc_calls, demo_calls, op_calls = _partition_tool_calls(value)
                     if op_calls:
                         yield "\n" + json.dumps({"__tool_calls__": op_calls})
+                    if demo_calls and iterations < MAX_HTMLDEMO_ITERS:
+                        if in_thinking:
+                            in_thinking = False
+                            yield THINK_CLOSE
+                        tool_msgs = []
+                        image_msgs = []
+                        for c in demo_calls:
+                            name = c["function"]["name"]
+                            args = dict(c["function"].get("arguments") or {})
+                            args["_want_screenshot"] = _is_vision
+                            try:
+                                result = await asyncio.to_thread(html_demo.dispatch, name, args)
+                            except Exception as exc:
+                                result = {"tool_error": True, "message": str(exc)}
+                            shot = result.pop("_screenshot_b64", None)
+                            yield "\n" + json.dumps({"__demo_step__": {
+                                "tool": name, "summary": _summarize_demo_step(name, result)}}) + "\n"
+                            if name == "save_demo" and result.get("saved"):
+                                yield "\n" + json.dumps({"__demo_card__": {
+                                    "preview_url": result.get("preview_url"),
+                                    "slug": result.get("slug")}}) + "\n"
+                            tool_msgs.append({"role": "tool", "tool_name": name,
+                                              "content": json.dumps(result)})
+                            if _is_vision and shot:
+                                image_msgs.append({"role": "user",
+                                    "content": "Screenshot of the rendered demo (visual review):",
+                                    "images": [shot]})
+                        new_messages = messages + [
+                            {"role": "assistant", "content": "", "tool_calls": demo_calls},
+                            *tool_msgs, *image_msgs]
+                        async for wire in relay(_stream_one(
+                                {**body_with_tools, "messages": new_messages}),
+                                new_messages, iterations + 1):
+                            yield wire
+                        return
+                    if demo_calls and iterations >= MAX_HTMLDEMO_ITERS:
+                        yield "\n" + json.dumps({"__demo_step__": {
+                            "tool": "html_demo", "summary": "(reached demo iteration limit)"}}) + "\n"
                     if cellc_calls and iterations < MAX_CELLC_ITERS:
                         if in_thinking:
                             in_thinking = False
@@ -923,6 +989,58 @@ def _inject_cellc_context(messages: list, last_user: str) -> bool:
     return True
 
 
+_HTMLDEMO_INTENT_RE = re.compile(
+    r"html\s+demo|self-contained\s+html|single[- ]file\s+html|canvas\s+game|"
+    r"\bmake\s+(?:me\s+)?a\s+game\b|physics\s+demo|interactive\s+demo|"
+    r"animation\s+in\s+html|webpage\s+that",
+    re.IGNORECASE,
+)
+
+
+def _is_html_demo_intent(text: str) -> bool:
+    return bool(_HTMLDEMO_INTENT_RE.search(text or ""))
+
+
+_HTMLDEMO_PROMPT_HINT = (
+    "\n\nYou can build and TEST self-contained HTML demos. Workflow: write the "
+    "full HTML, call preview_demo (returns a demo_id + diagnostics), then fix "
+    "issues with patch_demo(demo_id, edits) — small unique find/replace edits, "
+    "do NOT resend the whole file. When it renders cleanly, call save_demo. "
+    "Full house-style guidance is provided above when you start a demo."
+)
+
+
+def _inject_html_demo_context(messages: list, last_user: str) -> bool:
+    """If the html_demo skill is available and the message asks for a demo,
+    append the house-style guidance + one example to the system message.
+    Returns True if injected. Kept lean: guidance + a single example only."""
+    if not (html_demo.available() and _is_html_demo_intent(last_user)):
+        return False
+    messages[0]["content"] += "\n\n# Self-contained HTML demo guidance\n" + html_demo.guidance()
+    ex = html_demo.examples()
+    if ex:
+        messages[0]["content"] += (
+            f"\n\n# Example demo ({ex[0]['name']})\n```html\n{ex[0]['html']}\n```")
+    return True
+
+
+def _summarize_demo_step(name: str, result: dict) -> str:
+    if result.get("tool_error"):
+        return f"⚠ {name}: {result.get('message', 'error')[:80]}"
+    if name == "save_demo":
+        return f"save_demo → saved {result.get('slug', '')}"
+    if result.get("applied") is False:
+        return f"patch_demo → ✗ {str(result.get('reason', ''))[:70]}"
+    did = result.get("demo_id", "")
+    if not result.get("loaded", True):
+        return f"{name} → ✗ failed to load ({did})"
+    errs = len(result.get("console_errors", [])) + len(result.get("exceptions", []))
+    if errs:
+        return f"{name} → ✗ {errs} error(s) ({did})"
+    raf = "raf✓" if result.get("raf_ran") else "static"
+    return f"{name} → ✓ clean, {raf} ({did})"
+
+
 def _inject_text_files(messages: list, session_id: str, text_files: list) -> int:
     """Append the contents of named workspace text files to the last user
     message so the model can use them as reference.
@@ -1250,6 +1368,7 @@ async def manifest():
 
 
 app.mount("/static", StaticFiles(directory=ROOT / "frontend"), name="static")
+app.mount("/demos", StaticFiles(directory=DEMOS_DIR), name="demos")
 
 
 @app.get("/")

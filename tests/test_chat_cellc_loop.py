@@ -24,8 +24,9 @@ def test_partition_separates_cellc_and_ops():
         {"function": {"name": "cellc_check", "arguments": {"source": "x"}}},
         {"function": {"name": "trim_video", "arguments": {}}},
     ]
-    cellc_calls, op_calls = app_module._partition_cellc_calls(calls)
+    cellc_calls, demo_calls, op_calls = app_module._partition_tool_calls(calls)
     assert len(cellc_calls) == 1 and cellc_calls[0]["function"]["name"] == "cellc_check"
+    assert demo_calls == []
     assert len(op_calls) == 1 and op_calls[0]["function"]["name"] == "trim_video"
 
 
