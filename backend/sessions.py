@@ -1,0 +1,110 @@
+"""Server-side chat sessions in SQLite — the source of truth for history.
+
+Single-connection + lock (single uvicorn worker, same assumption as
+CapabilityCache/DemoStore). WAL mode so the rare overlapping write on the
+worker doesn't error. The summary/summary_upto_seq columns exist for Phase 2
+compaction; Phase 1 never writes them, so load_context returns the full
+transcript.
+"""
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+  id               TEXT PRIMARY KEY,
+  title            TEXT,
+  summary          TEXT,
+  summary_upto_seq INTEGER NOT NULL DEFAULT 0,
+  model            TEXT,
+  created          REAL NOT NULL,
+  updated          REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+  session_id TEXT NOT NULL,
+  seq        INTEGER NOT NULL,
+  role       TEXT NOT NULL,
+  content    TEXT NOT NULL,
+  tokens     INTEGER,
+  created    REAL NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+"""
+
+# Role used for the injected compaction summary (Phase 2). Defined here so the
+# store owns the convention; app.py prepends the real system prompt separately.
+SUMMARY_ROLE = "system"
+
+
+class SessionStoreError(Exception):
+    pass
+
+
+class SessionStore:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        if str(db_path) != ":memory:":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=3000")
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    def create_session(self, model: str, title: str | None = None) -> str:
+        sid = uuid.uuid4().hex
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sessions (id, title, summary, summary_upto_seq, model, created, updated) "
+                "VALUES (?, ?, NULL, 0, ?, ?, ?)",
+                (sid, title, model, now, now),
+            )
+            self._conn.commit()
+        return sid
+
+    def append_message(self, session_id: str, role: str, content: str,
+                       tokens: int | None = None) -> int:
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise SessionStoreError(f"unknown session_id {session_id!r}")
+            seq_row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE session_id = ?",
+                (session_id,)).fetchone()
+            seq = int(seq_row["next"])
+            self._conn.execute(
+                "INSERT INTO messages (session_id, seq, role, content, tokens, created) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, seq, role, content, tokens, now))
+            self._conn.execute(
+                "UPDATE sessions SET updated = ? WHERE id = ?", (now, session_id))
+            self._conn.commit()
+        return seq
+
+    def load_context(self, session_id: str) -> list[dict]:
+        with self._lock:
+            srow = self._conn.execute(
+                "SELECT summary, summary_upto_seq FROM sessions WHERE id = ?",
+                (session_id,)).fetchone()
+            if srow is None:
+                raise SessionStoreError(f"unknown session_id {session_id!r}")
+            upto = int(srow["summary_upto_seq"])
+            rows = self._conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? AND seq > ? ORDER BY seq",
+                (session_id, upto)).fetchall()
+        out: list[dict] = []
+        if srow["summary"]:
+            out.append({"role": SUMMARY_ROLE,
+                        "content": f"[Summary of earlier conversation]\n{srow['summary']}"})
+        out.extend({"role": r["role"], "content": r["content"]} for r in rows)
+        return out
