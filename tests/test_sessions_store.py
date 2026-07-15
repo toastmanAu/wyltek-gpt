@@ -25,3 +25,9 @@ def test_append_to_unknown_session_raises(tmp_path):
     s = _store(tmp_path)
     with pytest.raises(SessionStoreError):
         s.append_message("nope", "user", "x")
+
+
+def test_load_context_unknown_session_raises(tmp_path):
+    s = _store(tmp_path)
+    with pytest.raises(SessionStoreError):
+        s.load_context("nope")
