@@ -83,6 +83,8 @@ function startSpinner(targetEl, label) {
 }
 
 let history = [];
+let systemPrompt = "";  // captured in bootstrap; reused when a session resets/loads history
+let currentSessionId = null;  // SQLite chat-session id (distinct from SESSION, the upload workspace)
 let streaming = false;
 let converters = { enabled: [], disabled: [] };
 let operations = { enabled: [], disabled: [], bridges_available: [], output_dir: null };
@@ -212,7 +214,8 @@ async function bootstrap() {
 
   // 2. Optional: config + themes.
   const cfg = await safeJSON("/api/config", { system_prompt: "", default_theme: "tokyo-night", auto_router: {} });
-  history = [{ role: "system", content: cfg.system_prompt }];
+  systemPrompt = cfg.system_prompt || "";
+  history = [{ role: "system", content: systemPrompt }];
   autoRouter = cfg.auto_router || { captioner_model: "" };
 
   const themes = await safeJSON("/api/themes", []);
@@ -261,6 +264,9 @@ async function bootstrap() {
   // the placeholder is composed.
   populateTranslateLangs();
   updateComposerMode();
+
+  // Populate the sessions sidebar from the server-side store (best-effort).
+  loadSessions();
 }
 
 function setTheme(name) {
@@ -1626,7 +1632,20 @@ async function send() {
   // bytes never reach the model unless we ride its filename along. The backend
   // reads it from the workspace and appends the content to this turn's prompt.
   const attachText = !!(pending && isTextFile(pending.name));
-  const chatBody = { model: modelSel.value, messages: history };
+
+  // Session mode: lazily create/reuse a server-side session and post ONLY the
+  // new user turn — the backend loads prior history from SQLite and persists
+  // both sides. If session creation fails, fall back to legacy mode (post the
+  // full local history, server persists nothing) so chat never breaks.
+  let chatSessionId = null;
+  try {
+    chatSessionId = await ensureSession(modelSel.value);
+  } catch (e) {
+    console.warn("session unavailable, using legacy chat:", e);
+  }
+  const chatBody = chatSessionId
+    ? { model: modelSel.value, chat_session_id: chatSessionId, messages: [{ role: "user", content: text }] }
+    : { model: modelSel.value, messages: history };
   if (attachImage) {
     chatBody.image_files = [pending.name];
     chatBody.session_id = SESSION;
@@ -1726,6 +1745,9 @@ async function send() {
     streaming = false;
     sendBtn.disabled = false;
     input.focus();
+    // Refresh the sidebar so a newly created session and its server-side
+    // auto-title (generated after the first turn) appear.
+    if (currentSessionId) loadSessions();
   }
 }
 
@@ -2033,6 +2055,147 @@ document.getElementById("settings-reset").addEventListener("click", () => {
   localStorage.removeItem(STORAGE.theme);
   localStorage.removeItem(STORAGE.model);
   location.reload();
+});
+
+// ─── chat sessions (server-side SQLite history) ──────────────────────
+// currentSessionId is the SQLite chat-session key posted as chat_session_id
+// on /api/chat (see send()). It is NOT the upload workspace id (SESSION).
+// A null id means "legacy mode": the client posts full local history and the
+// server persists nothing — preserving the pre-sessions behaviour verbatim.
+
+// Clear the visible chat log (mirrors a fresh page load's empty #messages).
+function clearMessages() {
+  messagesEl.replaceChildren();
+}
+
+// Render one stored {role, content} turn. Thin wrapper over the existing
+// appendMsg renderer (createElement + textContent — no innerHTML, no XSS).
+function renderStoredMessage(role, content) {
+  appendMsg(role, content);
+}
+
+// Start a fresh chat: drop the session binding, clear the log, and reset
+// local history to just the system prompt (kept in sync for /check + display).
+function startNewChat() {
+  currentSessionId = null;
+  clearMessages();
+  history = [{ role: "system", content: systemPrompt }];
+}
+
+async function loadSessions() {
+  const ul = document.getElementById("session-list");
+  if (!ul) return;
+  let list = [];
+  try {
+    const r = await fetch("/api/sessions");
+    if (r.ok) list = await r.json();
+  } catch (e) {
+    console.warn("loadSessions failed:", e);
+    return;
+  }
+  ul.replaceChildren();
+  if (!list.length) {
+    const li = document.createElement("li");
+    li.className = "session-empty";
+    li.textContent = "No saved chats yet";
+    ul.appendChild(li);
+    return;
+  }
+  for (const s of list) {
+    const li = document.createElement("li");
+    if (s.id === currentSessionId) li.classList.add("active");
+
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = s.title || "Untitled";
+    li.appendChild(title);
+
+    const del = document.createElement("span");
+    del.className = "del";
+    del.textContent = "✕";
+    del.title = "Delete chat";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await fetch(`/api/sessions/${s.id}`, { method: "DELETE" });
+      } catch (err) {
+        console.warn("delete session failed:", err);
+      }
+      if (s.id === currentSessionId) startNewChat();
+      loadSessions();
+    });
+    li.appendChild(del);
+
+    li.addEventListener("click", () => openSession(s.id));
+    ul.appendChild(li);
+  }
+}
+
+async function openSession(id) {
+  let full;
+  try {
+    const r = await fetch(`/api/sessions/${id}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    full = await r.json();
+  } catch (e) {
+    appendMsg("error", `Could not open chat: ${e.message}`);
+    return;
+  }
+  currentSessionId = id;
+  clearMessages();
+  // Rebuild local history so slash commands (/check) and display stay coherent;
+  // the server remains the source of truth for context in session mode.
+  history = [{ role: "system", content: systemPrompt }];
+  for (const m of full.messages || []) {
+    history.push({ role: m.role, content: m.content });
+    renderStoredMessage(m.role, m.content);
+  }
+  loadSessions();
+  closeSessionsPanel();
+  input.focus();
+}
+
+// Lazily create a session on first send so an opened-but-unused "New chat"
+// never litters the store. Returns the session id, or throws on failure so
+// the caller can fall back to legacy mode.
+async function ensureSession(model) {
+  if (currentSessionId) return currentSessionId;
+  const r = await fetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  if (!r.ok) throw new Error(`create session failed: HTTP ${r.status}`);
+  currentSessionId = (await r.json()).id;
+  loadSessions();
+  return currentSessionId;
+}
+
+const sessionsBtn = document.getElementById("sessions-btn");
+const sessionsPanel = document.getElementById("sessions-panel");
+const sessionsBackdrop = document.getElementById("sessions-backdrop");
+const sessionsClose = document.getElementById("sessions-close");
+
+function openSessionsPanel() {
+  loadSessions();
+  sessionsPanel.classList.remove("hidden");
+  sessionsBackdrop.classList.remove("hidden");
+}
+function closeSessionsPanel() {
+  sessionsPanel.classList.add("hidden");
+  sessionsBackdrop.classList.add("hidden");
+}
+sessionsBtn.addEventListener("click", openSessionsPanel);
+sessionsClose.addEventListener("click", closeSessionsPanel);
+sessionsBackdrop.addEventListener("click", closeSessionsPanel);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !sessionsPanel.classList.contains("hidden")) closeSessionsPanel();
+});
+document.getElementById("new-session").addEventListener("click", () => {
+  startNewChat();
+  loadSessions();
+  closeSessionsPanel();
+  input.focus();
 });
 
 bootstrap().then(handleSharedParam);
