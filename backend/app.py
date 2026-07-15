@@ -441,6 +441,17 @@ async def chat(payload: dict):
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
 
+    sess_id = payload.get("chat_session_id")   # sessions store key; NOT the workspace session_id
+    if SESSIONS is not None and sess_id:
+        last_user = next((m.get("content", "") for m in reversed(incoming)
+                          if m.get("role") == "user"), "")
+        try:
+            SESSIONS.append_message(sess_id, "user", last_user)
+            history = SESSIONS.load_context(sess_id)     # [summary?] + prior turns incl. this user msg
+            messages = [{"role": "system", "content": _full_system_prompt()}, *history]
+        except SessionStoreError:
+            sess_id = None   # unknown session -> fall back to legacy assembly below
+
     cellc_chat = False
     if cellc_bridge.available():
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
@@ -512,6 +523,8 @@ async def chat(payload: dict):
         # because `relay` recurses with the same nonlocal state.
         attempted_fallback = False
         in_thinking = False
+        assistant_parts: list[str] = []
+        final_eval = {"tokens": None}
 
         async def relay(source, messages, iterations):
             nonlocal attempted_fallback, in_thinking
@@ -525,6 +538,7 @@ async def chat(payload: dict):
                     if in_thinking:
                         in_thinking = False
                         yield THINK_CLOSE
+                    assistant_parts.append(value)
                     yield value
                 elif kind == "tool_calls":
                     cellc_calls, demo_calls, op_calls = _partition_tool_calls(value)
@@ -592,6 +606,7 @@ async def chat(payload: dict):
                     if in_thinking:
                         in_thinking = False
                         yield THINK_CLOSE
+                    final_eval["tokens"] = value.get("eval_count")
                     yield "\n" + json.dumps({"__stats__": value})
                 elif kind == "error":
                     err_msg = str(value.get("error", "")).lower()
@@ -616,6 +631,13 @@ async def chat(payload: dict):
 
         async for wire in relay(_stream_one(body_with_tools), messages, 0):
             yield wire
+
+        if SESSIONS is not None and sess_id and assistant_parts:
+            try:
+                SESSIONS.append_message(sess_id, "assistant", "".join(assistant_parts),
+                                        tokens=final_eval["tokens"])
+            except SessionStoreError as exc:
+                log.warning("session %s: assistant persist failed: %s", sess_id, exc)
 
     return StreamingResponse(stream(), media_type="text/plain")
 
