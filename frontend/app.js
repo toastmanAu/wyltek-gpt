@@ -113,6 +113,14 @@ function isImageFile(name) {
   return !!name && IMAGE_EXT_RE.test(name);
 }
 
+// Text-like formats with no converter: the backend reads their bytes straight
+// into context (mirrors _TEXT_EXTS in app.py). Keep the two lists in step.
+const TEXT_EXT_RE = /\.(txt|md|markdown|json|csv|tsv|log|xml|ya?ml|ini|toml|rst)$/i;
+
+function isTextFile(name) {
+  return !!name && TEXT_EXT_RE.test(name);
+}
+
 function shouldAutoCaption(prompt) {
   if (!pending || !isImageFile(pending.name)) return false;
   if (!autoRouter.captioner_model) return false;
@@ -496,7 +504,15 @@ function showTray(file) {
   trayTarget.replaceChildren(...targets.map((t) => makeOption(t)));
   trayConvert.disabled = targets.length === 0;
   if (targets.length === 0) {
-    appendMsg("system", `no converters available for .${file.name.split(".").pop()}`);
+    const ext = file.name.split(".").pop();
+    if (isTextFile(file.name)) {
+      appendMsg(
+        "system",
+        `no converters for .${ext} — its text will be attached to your next message as reference`,
+      );
+    } else {
+      appendMsg("system", `no converters available for .${ext}`);
+    }
   }
   renderParams(findConverter(file.name, trayTarget.value));
   tray.classList.remove("hidden");
@@ -827,6 +843,54 @@ function renderCellcSteps(steps) {
   return steps.map((s) => `\n🔧 ${s.summary}`).join("");
 }
 
+// ─── html-demo skill: step chips + preview card sentinels ──────────
+// Same wire shape as __cellc_step__ (backend loop steps interleaved across
+// iterations) plus a one-shot __demo_card__ line emitted when the demo is
+// saved. Mirrors parseCellcSteps line-for-line — pure string functions, no
+// DOM here; rendering of the card is DOM-node-based (see appendDemoCard)
+// since this codebase never builds dynamic content via innerHTML/string
+// templating (no escapeHtml helper exists, and none should be added).
+
+// Extract ALL `{"__demo_step__": {...}}` sentinel lines. Returns
+// {steps: [{tool, summary}], cleanedText}.
+function parseDemoSteps(text) {
+  const steps = [];
+  const lines = text.split("\n");
+  const kept = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith('{"__demo_step__"')) {
+      try { steps.push(JSON.parse(t).__demo_step__); continue; } catch {}
+    }
+    kept.push(line);
+  }
+  return { steps, cleanedText: kept.join("\n") };
+}
+
+function renderDemoSteps(steps) {
+  if (!steps.length) return "";
+  return steps.map((s) => `\n▶ ${s.summary}`).join("");
+}
+
+// Extract the `{"__demo_card__": {preview_url, slug}}` sentinel line emitted
+// once when a demo is saved. Line-scanned like parseDemoSteps (rather than
+// the lastIndexOf approach used by parseStatsSentinel/parseToolCallSentinel)
+// so it composes the same way in the parser chain; only one card sentinel is
+// expected per stream but if more than one shows up, last-wins is fine.
+function parseDemoCard(text) {
+  let card = null;
+  const lines = text.split("\n");
+  const kept = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith('{"__demo_card__"')) {
+      try { card = JSON.parse(t).__demo_card__ || card; continue; } catch {}
+    }
+    kept.push(line);
+  }
+  return { card, cleanedText: kept.join("\n") };
+}
+
 // ─── reasoning (thinking) channel ──────────────────────────────────
 // Reasoning models (GLM-4.7-flash, qwen3.6) stream their chain-of-thought
 // on a separate Ollama `thinking` field. The backend splices that run into
@@ -1084,6 +1148,66 @@ function appendCodeDownloads(msgWrap, blocks) {
   }
   msgWrap.appendChild(row);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// html-demo skill: a tappable card that opens the saved demo full-screen.
+// Built with document.createElement (like appendCodeDownloads above) — never
+// innerHTML — since slug/preview_url trace back to model-influenced text.
+function appendDemoCard(msgWrap, card) {
+  if (!msgWrap || !card || !card.preview_url) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "demo-card";
+  btn.textContent = `▶ Preview demo: ${card.slug || "demo"}`;
+  btn.dataset.demoUrl = card.preview_url;
+  btn.addEventListener("click", () => openDemoOverlay(card.preview_url));
+  msgWrap.appendChild(btn);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// Full-screen iframe overlay for a saved html-demo. #demo-overlay is a
+// pre-placed empty host div in index.html; populated here via createElement/
+// property assignment only (iframe.src is a property set, not markup) so no
+// model-influenced string ever passes through innerHTML.
+function openDemoOverlay(url) {
+  const host = document.getElementById("demo-overlay");
+  if (!host || !url) return;
+  host.textContent = "";
+
+  const bar = document.createElement("div");
+  bar.className = "demo-overlay-bar";
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.textContent = "✕ Close";
+  closeBtn.addEventListener("click", closeDemoOverlay);
+
+  const openLink = document.createElement("a");
+  openLink.href = url;
+  openLink.target = "_blank";
+  openLink.rel = "noopener";
+  openLink.textContent = "Open in new tab ↗";
+
+  bar.append(closeBtn, openLink);
+
+  const frame = document.createElement("iframe");
+  frame.className = "demo-overlay-frame";
+  // Sandbox: allow JS (canvas/rAF need it) but deliberately withhold
+  // allow-same-origin. Without it the iframe gets an opaque origin, so a
+  // same-origin /demos/... document still cannot call backend APIs with the
+  // user's session or read localStorage — it just runs as an isolated page.
+  frame.setAttribute("sandbox", "allow-scripts");
+  frame.src = url;
+
+  host.append(bar, frame);
+  host.style.display = "flex";
+}
+
+function closeDemoOverlay() {
+  const host = document.getElementById("demo-overlay");
+  if (!host) return;
+  host.style.display = "none";
+  host.textContent = "";
 }
 
 function setStatsBusy(label) {
@@ -1498,9 +1622,17 @@ async function send() {
     isImageFile(pending.name) &&
     capabilities[modelSel.value]?.vision
   );
+  // Sticky text attachment: a pending .txt/.md/etc. has no converter, so its
+  // bytes never reach the model unless we ride its filename along. The backend
+  // reads it from the workspace and appends the content to this turn's prompt.
+  const attachText = !!(pending && isTextFile(pending.name));
   const chatBody = { model: modelSel.value, messages: history };
   if (attachImage) {
     chatBody.image_files = [pending.name];
+    chatBody.session_id = SESSION;
+  }
+  if (attachText) {
+    chatBody.text_files = [pending.name];
     chatBody.session_id = SESSION;
   }
 
@@ -1529,7 +1661,11 @@ async function send() {
     // stats/tool_calls sentinels. Each parser hands its cleanedText to
     // the next in the chain.
     const { steps: cellcSteps, cleanedText: noSteps } = parseCellcSteps(acc);
-    const { stats, cleanedText: noStats } = parseStatsSentinel(noSteps);
+    // html-demo skill: strip step + card sentinels the same way, chaining
+    // cleanedText through so downstream parsers never see them either.
+    const { steps: demoSteps, cleanedText: noDemoSteps } = parseDemoSteps(noSteps);
+    const { card: demoCard, cleanedText: noDemoCard } = parseDemoCard(noDemoSteps);
+    const { stats, cleanedText: noStats } = parseStatsSentinel(noDemoCard);
     if (stats) updateStatsBar(stats);
     const { calls: toolCalls, cleanedText } = parseToolCallSentinel(noStats);
     // Separate the reasoning channel before op/fence processing so tool
@@ -1553,7 +1689,7 @@ async function send() {
       displayedText = "[empty response]";
     }
     if (reasoning) reasoningBody(out).textContent = reasoning;
-    const stepsHint = renderCellcSteps(cellcSteps);
+    const stepsHint = renderCellcSteps(cellcSteps) + renderDemoSteps(demoSteps);
     out.textContent = stepsHint
       ? ` ${stepsHint.trim()}\n\n${displayedText}`
       : ` ${displayedText}`;
@@ -1565,6 +1701,9 @@ async function send() {
     // thinking, so scanning only the answer would drop the download button.
     const scanText = reasoning ? `${displayedText}\n\n${reasoning}` : displayedText;
     appendCodeDownloads(out.parentElement, extractCodeBlocks(scanText));
+
+    // html-demo skill: a tappable card that opens the saved demo full-screen.
+    appendDemoCard(out.parentElement, demoCard);
 
     // One card at a time — y/n/e handler operates on a single pending card.
     // If the model emits multiple, queue them sequentially.

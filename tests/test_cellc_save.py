@@ -21,8 +21,9 @@ def test_cellc_save_not_in_auto_loop_names():
 
 def test_cellc_save_partitions_as_op_call():
     calls = [{"function": {"name": "cellc_save", "arguments": {"name": "t", "source": "x"}}}]
-    cellc_calls, op_calls = app_module._partition_cellc_calls(calls)
+    cellc_calls, demo_calls, op_calls = app_module._partition_tool_calls(calls)
     assert cellc_calls == []
+    assert demo_calls == []
     assert len(op_calls) == 1 and op_calls[0]["function"]["name"] == "cellc_save"
 
 
