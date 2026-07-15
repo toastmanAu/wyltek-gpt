@@ -47,3 +47,17 @@ def test_legacy_mode_persists_nothing(monkeypatch):
     assert r.status_code == 200
     assert "Hello world" in r.text
     assert len(client.get("/api/sessions").json()) == before  # no new session/rows
+
+
+def test_session_mode_store_failure_degrades(monkeypatch):
+    _patch_stream(monkeypatch)
+    sid = client.post("/api/sessions", json={"model": "m"}).json()["id"]
+    import sqlite3 as _sq
+    def _boom(*a, **k):
+        raise _sq.OperationalError("database is locked")
+    monkeypatch.setattr(app_module.SESSIONS, "append_message", _boom)
+    r = client.post("/api/chat", json={
+        "model": "m", "chat_session_id": sid,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert "Hello world" in r.text          # stream still completes despite store failure

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -449,8 +450,8 @@ async def chat(payload: dict):
             SESSIONS.append_message(sess_id, "user", last_user)
             history = SESSIONS.load_context(sess_id)     # [summary?] + prior turns incl. this user msg
             messages = [{"role": "system", "content": _full_system_prompt()}, *history]
-        except SessionStoreError:
-            sess_id = None   # unknown session -> fall back to legacy assembly below
+        except (SessionStoreError, sqlite3.Error):
+            sess_id = None   # unknown session or store failure -> fall back to legacy assembly below
 
     cellc_chat = False
     if cellc_bridge.available():
@@ -636,7 +637,7 @@ async def chat(payload: dict):
             try:
                 SESSIONS.append_message(sess_id, "assistant", "".join(assistant_parts),
                                         tokens=final_eval["tokens"])
-            except SessionStoreError as exc:
+            except (SessionStoreError, sqlite3.Error) as exc:
                 log.warning("session %s: assistant persist failed: %s", sess_id, exc)
 
     return StreamingResponse(stream(), media_type="text/plain")
