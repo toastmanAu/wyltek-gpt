@@ -1,4 +1,6 @@
 # tests/test_sessions_endpoints.py
+import asyncio
+
 from fastapi.testclient import TestClient
 from backend import app as app_module
 
@@ -29,7 +31,7 @@ def test_auto_title_fallback_uses_truncated_first_message(monkeypatch):
     # No summary_model / captioner configured -> fallback path (no model call).
     monkeypatch.setitem(app_module.CONFIG, "auto_router", {})
     sid = app_module.SESSIONS.create_session(model="m")   # title None
-    app_module._auto_title(sid, "Explain how WebGPU pipelines work in detail", "…")
+    asyncio.run(app_module._auto_title(sid, "Explain how WebGPU pipelines work in detail", "…"))
     title = app_module.SESSIONS.get_full(sid)["title"]
     assert title and len(title) <= 60
     assert title.startswith("Explain how WebGPU")

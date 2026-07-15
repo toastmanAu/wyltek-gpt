@@ -82,6 +82,7 @@ except Exception as exc:  # never block boot on the demo feature
     log.warning("html_demo init failed: %s", exc)
 
 # ─── Sessions store (server-side history) ────────────────────────────
+_BG_TASKS: set = set()  # holds fire-and-forget asyncio.Task refs (e.g. auto-title) alive
 SESSIONS: SessionStore | None = None
 try:
     SESSIONS = SessionStore(ROOT / "data" / "sessions.db")
@@ -217,24 +218,24 @@ def _full_system_prompt() -> str:
 # ─── Existing endpoints (config / themes / models / chat / converters) ──
 
 
-def _titling_call(model: str, first_user: str, first_assistant: str) -> str:
+async def _titling_call(model: str, first_user: str, first_assistant: str) -> str:
     """Small non-streaming Ollama call that proposes a short title. Best-effort:
     any failure (timeout, model missing, bad response) returns "" so the caller
     falls back to the truncated-first-message title."""
     prompt = ("Give a 3-6 word title (no quotes, no punctuation at the end) for this chat:\n\n"
               f"User: {first_user[:500]}\nAssistant: {first_assistant[:500]}\nTitle:")
     try:
-        r = httpx.post(f"{OLLAMA_URL}/api/generate",
-                       json={"model": model, "prompt": prompt, "stream": False,
-                             "options": {"num_predict": 24, "temperature": 0.3}},
-                       timeout=30)
-        r.raise_for_status()
-        return (r.json().get("response") or "").strip().strip('"')[:60]
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": model, "prompt": prompt, "stream": False,
+                                   "options": {"num_predict": 24, "temperature": 0.3}})
+            r.raise_for_status()
+            return (r.json().get("response") or "").strip().strip('"')[:60]
     except Exception:
         return ""
 
 
-def _auto_title(sess_id: str, first_user: str, first_assistant: str) -> None:
+async def _auto_title(sess_id: str, first_user: str, first_assistant: str) -> None:
     """Give a still-untitled session a short title. Uses auto_router.summary_model
     (fallback captioner_model, else a truncated first message). Never raises."""
     if SESSIONS is None:
@@ -247,7 +248,7 @@ def _auto_title(sess_id: str, first_user: str, first_assistant: str) -> None:
         model = auto.get("summary_model") or auto.get("captioner_model") or ""
         title = ""
         if model:
-            title = _titling_call(model, first_user, first_assistant)
+            title = await _titling_call(model, first_user, first_assistant)
         if not title:
             title = (first_user or "New chat").strip().splitlines()[0][:60]
         SESSIONS.rename(sess_id, title[:60])
@@ -677,9 +678,12 @@ async def chat(payload: dict):
                                         tokens=final_eval["tokens"])
                 full = SESSIONS.get_full(sess_id)
                 if full and not full.get("title") and len(full["messages"]) <= 2:
-                    _auto_title(sess_id, incoming and next(
-                        (m.get("content", "") for m in incoming if m.get("role") == "user"), ""),
-                        "".join(assistant_parts))
+                    _first_user = next((m.get("content", "") for m in incoming
+                                        if m.get("role") == "user"), "")
+                    _t = asyncio.create_task(
+                        _auto_title(sess_id, _first_user, "".join(assistant_parts)))
+                    _BG_TASKS.add(_t)
+                    _t.add_done_callback(_BG_TASKS.discard)
             except (SessionStoreError, sqlite3.Error) as exc:
                 log.warning("session %s: assistant persist failed: %s", sess_id, exc)
 
