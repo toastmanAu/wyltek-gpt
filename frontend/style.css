@@ -566,4 +566,71 @@ body {
 .drop-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drop-meta { opacity: 0.6; font-size: 0.85em; white-space: nowrap; }
 .drop-empty { opacity: 0.6; padding: 1rem 0.2rem; }
+
+/* ─── html-demo skill: preview card + full-screen overlay ─── */
+.demo-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.4rem 0 0 1.5rem;
+  padding: 0.3rem 0.85rem;
+  font: inherit;
+  font-size: 0.85em;
+  color: var(--accent);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.demo-card:hover,
+.demo-card:focus {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  outline: none;
+}
+
+#demo-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  flex-direction: column;
+  background: var(--bg-0);
+  padding-top: env(safe-area-inset-top);
+}
+.demo-overlay-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+}
+.demo-overlay-bar button,
+.demo-overlay-bar a {
+  font: inherit;
+  font-size: 0.95em;
+  color: var(--fg-0);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  text-decoration: none;
+}
+.demo-overlay-bar button:hover,
+.demo-overlay-bar a:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.demo-overlay-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  /* Demo HTML is arbitrary and usually assumes a light canvas; keep this
+     fixed regardless of app theme so demos render as authored. */
+  background: #fff;
+}
 .drop-foot { padding: 0.6rem; border-top: 1px solid var(--border, #333); text-align: right; }
