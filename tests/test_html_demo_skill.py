@@ -63,3 +63,13 @@ def test_dispatch_non_string_name_does_not_raise():
     r = html_demo.dispatch("save_demo", {"demo_id": did, "name": 12345})
     assert r.get("saved") is True
     assert r["preview_url"].startswith("/demos/")
+
+
+def test_available_is_stable_inside_event_loop():
+    import asyncio
+    boot_val = html_demo.available()          # init_store already ran (autouse fixture)
+
+    async def _probe():
+        return html_demo.available()
+
+    assert asyncio.run(_probe()) == boot_val   # must not flip to False inside a loop

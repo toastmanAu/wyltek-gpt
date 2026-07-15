@@ -22,11 +22,17 @@ _MAX_HTML = 400_000
 HTML_DEMO_TOOL_NAMES = frozenset({"preview_demo", "patch_demo", "save_demo"})
 
 _STORE: DemoStore | None = None
+_AVAILABLE: bool | None = None
 
 
 def init_store(demos_dir: Path) -> DemoStore:
-    global _STORE
+    global _STORE, _AVAILABLE
     _STORE = DemoStore(demos_dir)
+    # Probe Playwright/Chromium ONCE here, at import/boot time — before uvicorn's
+    # event loop exists. render.available() uses Playwright's sync API, which
+    # RAISES if called on a running asyncio loop, so it must never be called
+    # per-request from the async chat path. Cache the boot result instead.
+    _AVAILABLE = _render.available()
     return _STORE
 
 
@@ -37,7 +43,9 @@ def store() -> DemoStore:
 
 
 def available() -> bool:
-    return _render.available()
+    # Return the boot-time probe (see init_store). Falls back to a live probe
+    # only if init_store was never called (e.g. isolated unit tests).
+    return _AVAILABLE if _AVAILABLE is not None else _render.available()
 
 
 def guidance() -> str:

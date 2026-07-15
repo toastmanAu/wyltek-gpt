@@ -1368,7 +1368,7 @@ async def manifest():
 
 
 app.mount("/static", StaticFiles(directory=ROOT / "frontend"), name="static")
-app.mount("/demos", StaticFiles(directory=DEMOS_DIR), name="demos")
+app.mount("/demos", StaticFiles(directory=DEMOS_DIR, check_dir=False), name="demos")
 
 
 @app.get("/")

@@ -1192,6 +1192,11 @@ function openDemoOverlay(url) {
 
   const frame = document.createElement("iframe");
   frame.className = "demo-overlay-frame";
+  // Sandbox: allow JS (canvas/rAF need it) but deliberately withhold
+  // allow-same-origin. Without it the iframe gets an opaque origin, so a
+  // same-origin /demos/... document still cannot call backend APIs with the
+  // user's session or read localStorage — it just runs as an isolated page.
+  frame.setAttribute("sandbox", "allow-scripts");
   frame.src = url;
 
   host.append(bar, frame);
