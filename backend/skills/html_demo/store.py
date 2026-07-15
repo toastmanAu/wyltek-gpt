@@ -26,6 +26,7 @@ class DemoStore:
     def __init__(self, demos_dir: Path):
         self.demos_dir = demos_dir
         self._store: "OrderedDict[str, dict]" = OrderedDict()
+        self._owner: dict[str, str] = {}   # saved filename -> demo_id
         self._counter = 0
 
     def create(self, html: str, name: str | None = None) -> str:
@@ -56,6 +57,8 @@ class DemoStore:
             return False, f"unknown demo_id {demo_id!r}"
         html = rec["html"]
         for i, e in enumerate(edits or []):
+            if not isinstance(e, dict):
+                return False, f"edit {i}: each edit must be an object with 'find' and 'replace'"
             find = e.get("find")
             repl = e.get("replace")
             if not isinstance(find, str) or not isinstance(repl, str):
@@ -80,10 +83,20 @@ class DemoStore:
             raise KeyError(demo_id)
         slug = _slugify(name or rec["name"])
         self.demos_dir.mkdir(parents=True, exist_ok=True)
-        path = self.demos_dir / f"{slug}.html"
-        n = 1
-        while path.exists() and path.read_text(errors="replace") != rec["html"]:
-            path = self.demos_dir / f"{slug}-{n}.html"
-            n += 1
+        # A demo overwrites its OWN previously-saved file (the create -> patch ->
+        # save iteration loop). Only a DIFFERENT demo claiming the same slug gets
+        # a -N suffix, and a pre-existing on-disk file we don't own is never clobbered.
+        existing = rec.get("saved_path")
+        if (existing and Path(existing).name == f"{slug}.html"
+                and self._owner.get(f"{slug}.html") == demo_id):
+            path = Path(existing)
+        else:
+            path = self.demos_dir / f"{slug}.html"
+            n = 1
+            while path.exists() and self._owner.get(path.name) != demo_id:
+                path = self.demos_dir / f"{slug}-{n}.html"
+                n += 1
         path.write_text(rec["html"])
+        rec["saved_path"] = str(path)
+        self._owner[path.name] = demo_id
         return {"path": str(path), "slug": path.stem, "preview_url": f"/demos/{path.name}"}

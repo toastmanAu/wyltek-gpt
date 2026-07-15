@@ -68,3 +68,21 @@ def test_slugify():
     assert _slugify("Hello World") == "hello-world"
     assert _slugify("  ") == "demo"
     assert _slugify("A/B:C") == "a-b-c"
+
+
+def test_save_same_demo_overwrites_not_suffixes(tmp_path):
+    s = DemoStore(tmp_path)
+    did = s.create("<html>V1</html>", "widget")
+    r1 = s.save(did)
+    s.replace(did, "<html>V2</html>")
+    r2 = s.save(did)
+    assert r1["path"] == r2["path"]                      # same file, not widget-1.html
+    assert Path(r2["path"]).read_text() == "<html>V2</html>"
+    assert list(tmp_path.glob("*.html")) == [Path(r2["path"])]  # exactly one file on disk
+
+
+def test_apply_patch_non_dict_edit_fails_gracefully(tmp_path):
+    s = DemoStore(tmp_path)
+    did = s.create("<h1>hi</h1>")
+    ok, reason = s.apply_patch(did, ["not a dict"])
+    assert ok is False and "object" in reason
