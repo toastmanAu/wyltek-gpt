@@ -217,6 +217,44 @@ def _full_system_prompt() -> str:
 # ─── Existing endpoints (config / themes / models / chat / converters) ──
 
 
+def _titling_call(model: str, first_user: str, first_assistant: str) -> str:
+    """Small non-streaming Ollama call that proposes a short title. Best-effort:
+    any failure (timeout, model missing, bad response) returns "" so the caller
+    falls back to the truncated-first-message title."""
+    prompt = ("Give a 3-6 word title (no quotes, no punctuation at the end) for this chat:\n\n"
+              f"User: {first_user[:500]}\nAssistant: {first_assistant[:500]}\nTitle:")
+    try:
+        r = httpx.post(f"{OLLAMA_URL}/api/generate",
+                       json={"model": model, "prompt": prompt, "stream": False,
+                             "options": {"num_predict": 24, "temperature": 0.3}},
+                       timeout=30)
+        r.raise_for_status()
+        return (r.json().get("response") or "").strip().strip('"')[:60]
+    except Exception:
+        return ""
+
+
+def _auto_title(sess_id: str, first_user: str, first_assistant: str) -> None:
+    """Give a still-untitled session a short title. Uses auto_router.summary_model
+    (fallback captioner_model, else a truncated first message). Never raises."""
+    if SESSIONS is None:
+        return
+    try:
+        full = SESSIONS.get_full(sess_id)
+        if full is None or full.get("title"):
+            return   # already titled or gone
+        auto = CONFIG.get("auto_router") or {}
+        model = auto.get("summary_model") or auto.get("captioner_model") or ""
+        title = ""
+        if model:
+            title = _titling_call(model, first_user, first_assistant)
+        if not title:
+            title = (first_user or "New chat").strip().splitlines()[0][:60]
+        SESSIONS.rename(sess_id, title[:60])
+    except Exception as exc:   # titling must never break chat
+        log.warning("auto-title failed for %s: %s", sess_id, exc)
+
+
 @app.get("/api/config")
 async def get_config():
     auto = CONFIG.get("auto_router") or {}
@@ -637,6 +675,11 @@ async def chat(payload: dict):
             try:
                 SESSIONS.append_message(sess_id, "assistant", "".join(assistant_parts),
                                         tokens=final_eval["tokens"])
+                full = SESSIONS.get_full(sess_id)
+                if full and not full.get("title") and len(full["messages"]) <= 2:
+                    _auto_title(sess_id, incoming and next(
+                        (m.get("content", "") for m in incoming if m.get("role") == "user"), ""),
+                        "".join(assistant_parts))
             except (SessionStoreError, sqlite3.Error) as exc:
                 log.warning("session %s: assistant persist failed: %s", sess_id, exc)
 

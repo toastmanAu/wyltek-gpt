@@ -55,6 +55,7 @@ storage:
 # ──────────────────────────────────────────────────────────────────
 auto_router:
   captioner_model: qwen3-omni-captioner:30b-a3b-q4
+  summary_model: ""        # titles (Phase 1) + compaction (Phase 2); empty disables the model call
 
 # ──────────────────────────────────────────────────────────────────
 # Bridges — external services the model can reach via fixed-shape
