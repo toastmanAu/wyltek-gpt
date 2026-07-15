@@ -208,6 +208,20 @@ async def get_config():
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif")
 
+# Plain-text formats that carry no dedicated converter: their bytes are
+# already model-readable, so we inject their content into context directly
+# instead of routing them through the (non-existent) converter pipeline.
+_TEXT_EXTS = (
+    ".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".log",
+    ".xml", ".yaml", ".yml", ".ini", ".toml", ".rst",
+)
+# Per-file ceiling on injected text. Injected reference content shares the
+# num_ctx budget with the system prompt, the model's reasoning, and its
+# output — so a single attachment must not be allowed to crowd those out.
+# ~60k chars ≈ ~15k tokens, comfortably under _CHAT_DEFAULT_NUM_CTX while
+# still swallowing whole specs (the BIP-0039 mediawiki is ~5.5 KB).
+_MAX_TEXT_INJECT_CHARS = 60_000
+
 
 @app.post("/api/auto-caption")
 async def auto_caption(payload: dict):
@@ -391,6 +405,7 @@ async def chat(payload: dict):
     model = payload.get("model")
     incoming = payload.get("messages", [])
     image_files = payload.get("image_files") or []
+    text_files = payload.get("text_files") or []
     session_id = payload.get("session_id", "default")
     if not model or not incoming:
         raise HTTPException(400, "Missing 'model' or 'messages'")
@@ -402,6 +417,11 @@ async def chat(payload: dict):
     if cellc_bridge.available():
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
         cellc_chat = _inject_cellc_context(messages, last_user)
+
+    if text_files:
+        injected = _inject_text_files(messages, session_id, text_files)
+        if injected:
+            log.info("chat: injected %d text file(s) into context for %s", injected, model)
 
     if image_files:
         images_b64: list[str] = []
@@ -618,9 +638,13 @@ _LANG_CODE_RE = re.compile(r"^[a-z]{2}(?:[-_][A-Za-z]{2,4})?$")
 _TRANSLATE_MAX_TEXT_CHARS = 8000
 _TRANSLATE_DEFAULT_NUM_CTX = 2048
 # Default context window for /api/chat. Ollama otherwise caps unspecified
-# num_ctx at ~4096, which truncates agentic cellc loops. 16k fits qwen3.6:27b
+# num_ctx at ~4096, which truncates agentic cellc loops. num_ctx is the *total*
+# budget shared by the system prompt, any injected reference files, the model's
+# reasoning (<think>) tokens, AND its output — so heavy single-shot generations
+# (e.g. a self-contained page embedding the 2048-word BIP39 list) exhaust 16k
+# and truncate mid-stream. 24k gives that headroom and still fits qwen3.6:27b
 # Q4 on a 24GB card with VRAM free; callers can override via payload num_ctx.
-_CHAT_DEFAULT_NUM_CTX = 16384
+_CHAT_DEFAULT_NUM_CTX = 24576
 
 
 @app.post("/api/operations/translate")
@@ -897,6 +921,58 @@ def _inject_cellc_context(messages: list, last_user: str) -> bool:
     if notes:
         messages[0]["content"] += "\n\n# CellScript design notes\n" + notes
     return True
+
+
+def _inject_text_files(messages: list, session_id: str, text_files: list) -> int:
+    """Append the contents of named workspace text files to the last user
+    message so the model can use them as reference.
+
+    The upload pipeline only stores bytes and converts *binary* documents
+    (pdf/docx/…) to markdown; plain text/markdown/json have no converter, so
+    without this their content never reaches the model — it only ever sees
+    the filename. Mirrors the ``image_files`` contract: filenames are
+    resolved + validated against the session workspace, unknown/oversized/
+    non-text entries are skipped with a log line, never raising. Oversized
+    files are clamped to ``_MAX_TEXT_INJECT_CHARS`` with a visible marker so
+    the injected reference can't silently blow the num_ctx budget. Returns
+    the number of files actually injected."""
+    if not text_files:
+        return 0
+    blocks: list[str] = []
+    for name in text_files:
+        try:
+            _, path = _resolve_in_workspace(session_id, name)
+        except (ValueError, HTTPException) as exc:
+            log.warning("chat: cannot resolve text file %r: %s", name, exc)
+            continue
+        if not path.exists() or path.suffix.lower() not in _TEXT_EXTS:
+            log.warning("chat: skipping non-text or missing file %r", name)
+            continue
+        try:
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        except OSError as exc:
+            log.warning("chat: cannot read text file %r: %s", name, exc)
+            continue
+        marker = ""
+        if len(text) > _MAX_TEXT_INJECT_CHARS:
+            dropped = len(text) - _MAX_TEXT_INJECT_CHARS
+            text = text[:_MAX_TEXT_INJECT_CHARS]
+            marker = f"\n[… truncated {dropped} chars of {path.name}]"
+        blocks.append(f"--- attached file: {path.name} ---\n{text}{marker}")
+    if not blocks:
+        return 0
+    appendix = (
+        "\n\nThe user attached the following file(s) as reference. Use their "
+        "contents to answer the request above:\n\n" + "\n\n".join(blocks)
+    )
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            m["content"] = (m.get("content") or "") + appendix
+            return len(blocks)
+    # No user message at all (degenerate) — attach to the system prompt so
+    # the reference is at least present rather than silently dropped.
+    messages[0]["content"] += appendix
+    return len(blocks)
 
 
 _CELLC_MAX_SOURCE = 200_000

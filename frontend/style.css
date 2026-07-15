@@ -210,6 +210,30 @@ body {
 .msg.error .role,
 .msg.error .content { color: var(--error); }
 
+/* Reasoning / chain-of-thought block — visually distinct from the answer:
+   theme accent colour, dimmed and italic, set off by a left rule. */
+.msg.assistant .reasoning {
+  margin: 0.15rem 0 0.45rem 1.5rem;
+  border-left: 2px solid var(--border);
+  padding-left: 0.6rem;
+}
+.msg.assistant .reasoning > summary {
+  cursor: pointer;
+  font-size: 0.8em;
+  color: var(--accent);
+  opacity: 0.85;
+  user-select: none;
+  list-style: none;
+}
+.msg.assistant .reasoning > summary::before { content: "🧠 "; }
+.msg.assistant .reasoning-body {
+  margin-top: 0.3rem;
+  font-style: italic;
+  color: var(--accent);
+  opacity: 0.75;
+  white-space: pre-wrap;
+}
+
 .code-downloads {
   display: flex;
   flex-wrap: wrap;

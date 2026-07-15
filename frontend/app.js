@@ -113,6 +113,14 @@ function isImageFile(name) {
   return !!name && IMAGE_EXT_RE.test(name);
 }
 
+// Text-like formats with no converter: the backend reads their bytes straight
+// into context (mirrors _TEXT_EXTS in app.py). Keep the two lists in step.
+const TEXT_EXT_RE = /\.(txt|md|markdown|json|csv|tsv|log|xml|ya?ml|ini|toml|rst)$/i;
+
+function isTextFile(name) {
+  return !!name && TEXT_EXT_RE.test(name);
+}
+
 function shouldAutoCaption(prompt) {
   if (!pending || !isImageFile(pending.name)) return false;
   if (!autoRouter.captioner_model) return false;
@@ -496,7 +504,15 @@ function showTray(file) {
   trayTarget.replaceChildren(...targets.map((t) => makeOption(t)));
   trayConvert.disabled = targets.length === 0;
   if (targets.length === 0) {
-    appendMsg("system", `no converters available for .${file.name.split(".").pop()}`);
+    const ext = file.name.split(".").pop();
+    if (isTextFile(file.name)) {
+      appendMsg(
+        "system",
+        `no converters for .${ext} — its text will be attached to your next message as reference`,
+      );
+    } else {
+      appendMsg("system", `no converters available for .${ext}`);
+    }
   }
   renderParams(findConverter(file.name, trayTarget.value));
   tray.classList.remove("hidden");
@@ -1498,9 +1514,17 @@ async function send() {
     isImageFile(pending.name) &&
     capabilities[modelSel.value]?.vision
   );
+  // Sticky text attachment: a pending .txt/.md/etc. has no converter, so its
+  // bytes never reach the model unless we ride its filename along. The backend
+  // reads it from the workspace and appends the content to this turn's prompt.
+  const attachText = !!(pending && isTextFile(pending.name));
   const chatBody = { model: modelSel.value, messages: history };
   if (attachImage) {
     chatBody.image_files = [pending.name];
+    chatBody.session_id = SESSION;
+  }
+  if (attachText) {
+    chatBody.text_files = [pending.name];
     chatBody.session_id = SESSION;
   }
 
