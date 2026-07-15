@@ -156,6 +156,13 @@ echo
 DUCKDB_OK=0; command -v duckdb >/dev/null && { ok duckdb; DUCKDB_OK=1; } || miss duckdb
 YQ_OK=0;     command -v yq >/dev/null     && { ok yq;     YQ_OK=1; } || miss yq
 WHISPER_OK=0;command -v whisper >/dev/null && { ok whisper; WHISPER_OK=1; } || miss "whisper (optional, audio transcription)"
+HTMLDEMO_OK=0
+if [ -x ./.venv/bin/python ] && ./.venv/bin/python -c "import playwright, PIL" >/dev/null 2>&1; then
+  ok "html-demo render deps (playwright+pillow, optional)"
+  HTMLDEMO_OK=1
+else
+  miss "html-demo render deps (playwright+pillow, optional — html-demo skill disabled without them)"
+fi
 
 if [ "$CHECK_ONLY" = "1" ]; then
   echo
@@ -242,6 +249,19 @@ if prompt_yn "set up the python venv and install fastapi/uvicorn?"; then
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q -r requirements.txt
   ok "venv ready — start the app with:  ./.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000"
+fi
+
+# ─── html-demo skill render deps (optional) ────────────────────────
+if [ "$HTMLDEMO_OK" = "0" ]; then
+  if [ -x ./.venv/bin/python ]; then
+    if prompt_yn "install playwright + pillow for the html-demo skill (headless render, optional)?"; then
+      ./.venv/bin/pip install -q playwright pillow && ./.venv/bin/playwright install chromium \
+        && ok "html-demo render deps installed" \
+        || warn "failed: playwright/pillow install — html-demo skill will stay disabled"
+    fi
+  else
+    warn "skipping html-demo render deps — venv not set up (html-demo skill will stay disabled)"
+  fi
 fi
 
 # ─── ollama check ──────────────────────────────────────────────────

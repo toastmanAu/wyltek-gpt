@@ -25,3 +25,6 @@ images/
 # Test scratch
 /tmp/
 .superpowers/
+
+# Generated HTML demos (html-demo skill output)
+demos/

@@ -49,6 +49,13 @@ below for the HTTPS requirement).
 - **Indicatif-style spinners** for loading states, configurable in the
   settings drawer (braille, dots, line, bar, arrow, bounce, pulse, moon,
   clock — all rendered as Unicode, no Rust required)
+- **Build & test self-contained HTML demos** — ask a tool-capable model for a
+  demo (game, physics, animation) and it writes the HTML, renders it in a
+  headless browser, reads back diagnostics (console errors, whether the
+  animation loop ran) and — if the model has vision — a screenshot, iterates
+  via small patches to stay within context, then saves it. Tap the preview
+  card to see it full-screen on your phone. Requires Playwright + Chromium
+  (the installer offers to set these up); degrades gracefully without them.
 
 ## Two things to fill in
 
