@@ -38,6 +38,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
 
 # Role used for the injected compaction summary (Phase 2). Defined here so the
 # store owns the convention; app.py prepends the real system prompt separately.
+# Phase 2 trap: load_context prepends this as history[0], and app.py also prepends
+# its own system prompt — so once a summary is set, two back-to-back system messages
+# reach the model. Change this role or dedupe in app.py when compaction lands.
 SUMMARY_ROLE = "system"
 
 

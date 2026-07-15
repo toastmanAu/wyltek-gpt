@@ -489,7 +489,8 @@ async def chat(payload: dict):
             SESSIONS.append_message(sess_id, "user", last_user)
             history = SESSIONS.load_context(sess_id)     # [summary?] + prior turns incl. this user msg
             messages = [{"role": "system", "content": _full_system_prompt()}, *history]
-        except (SessionStoreError, sqlite3.Error):
+        except (SessionStoreError, sqlite3.Error) as exc:
+            log.warning("session %s: context load failed, falling back to legacy assembly: %s", sess_id, exc)
             sess_id = None   # unknown session or store failure -> fall back to legacy assembly below
 
     cellc_chat = False
