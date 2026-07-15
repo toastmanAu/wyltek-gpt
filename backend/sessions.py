@@ -141,3 +141,10 @@ class SessionStore:
             self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._conn.commit()
+
+    def set_summary(self, session_id: str, summary: str, upto_seq: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET summary = ?, summary_upto_seq = ?, updated = ? WHERE id = ?",
+                (summary, int(upto_seq), time.time(), session_id))
+            self._conn.commit()

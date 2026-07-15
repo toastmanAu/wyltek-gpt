@@ -1,6 +1,6 @@
 from pathlib import Path
 import pytest
-from backend.sessions import SessionStore, SessionStoreError
+from backend.sessions import SessionStore, SessionStoreError, SUMMARY_ROLE
 
 
 def _store(tmp_path) -> SessionStore:
@@ -52,3 +52,19 @@ def test_list_get_full_rename_delete(tmp_path):
     s.delete(b)
     assert s.get_full(b) is None
     assert [x["id"] for x in s.list_sessions()] == [a]
+
+
+def test_set_summary_watermark_replay(tmp_path):
+    s = _store(tmp_path)
+    sid = s.create_session(model="m")
+    for i in range(1, 11):                      # seqs 1..10
+        s.append_message(sid, "user" if i % 2 else "assistant", f"msg{i}")
+    s.set_summary(sid, "we discussed msgs 1-8", upto_seq=8)
+
+    ctx = s.load_context(sid)
+    assert ctx[0] == {"role": SUMMARY_ROLE,
+                      "content": "[Summary of earlier conversation]\nwe discussed msgs 1-8"}
+    assert [m["content"] for m in ctx[1:]] == ["msg9", "msg10"]   # only seq > 8
+
+    # full transcript still preserves the pre-watermark rows
+    assert len(s.get_full(sid)["messages"]) == 10
