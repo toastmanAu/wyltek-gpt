@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+  html,body{margin:0;height:100dvh;background:#0b1021;overflow:hidden}
+  canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W,H,dpr; function resize(){ dpr=devicePixelRatio||1; W=cv.width=innerWidth*dpr; H=cv.height=innerHeight*dpr; }
+addEventListener('resize',resize); resize();
+let x=W/2,y=H/2,vx=180*dpr,vy=140*dpr,r=24*dpr;
+addEventListener('pointerdown',e=>{ x=e.clientX*dpr; y=e.clientY*dpr; vx=(Math.random()*2-1)*300*dpr; vy=(Math.random()*2-1)*300*dpr; });
+let last=performance.now();
+function frame(t){ const dt=Math.min((t-last)/1000,0.05); last=t;
+  x+=vx*dt; y+=vy*dt;
+  if(x<r){x=r;vx=-vx} if(x>W-r){x=W-r;vx=-vx}
+  if(y<r){y=r;vy=-vy} if(y>H-r){y=H-r;vy=-vy}
+  ctx.fillStyle='#0b1021'; ctx.fillRect(0,0,W,H);
+  ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fillStyle='#4fd1c5'; ctx.fill();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
