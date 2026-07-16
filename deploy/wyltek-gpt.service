@@ -1,0 +1,19 @@
+[Unit]
+Description=wyltek-gpt — local Ollama browser terminal + 25-converter pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/local-chatbot
+ExecStart=%h/local-chatbot/.venv/bin/uvicorn backend.app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Optional CellScript converter integration — set these to your local CellScript
+# checkout if you use the cellc pipeline; safe to remove otherwise.
+Environment=CELLC_BIN=%h/CellScript/target/release/cellc
+Environment=CELLSCRIPT_REPO=%h/CellScript
+
+[Install]
+WantedBy=default.target
