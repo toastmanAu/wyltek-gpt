@@ -79,6 +79,14 @@
     "tool_calling": "rejected",
     "vision": false
   },
+  "hf.co/bartowski/migtissera_Tess-4-27B-GGUF:Q4_K_M": {
+    "audio": false,
+    "last_probed": "2026-07-17T12:15:12+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
+  },
   "hf.co/deepreinforce-ai/Ornith-1.0-9B-GGUF:Q6_K": {
     "audio": false,
     "last_probed": "2026-07-15T06:27:36+00:00",
@@ -105,7 +113,7 @@
   },
   "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_S": {
     "audio": false,
-    "last_probed": "2026-07-17T07:27:41+00:00",
+    "last_probed": "2026-07-17T08:54:12+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
