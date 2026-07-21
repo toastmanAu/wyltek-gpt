@@ -1,3 +1,5 @@
+import time
+
 from finetune.bakeoff.classify import classify_response
 
 
@@ -99,4 +101,84 @@ def test_native_wins_over_fenced_op_block():
         '```op:preview_demo\n{"html":"x"}\n```\n'
         '<tool_call>{"name":"preview_demo","arguments":{"html":"x"}}</tool_call>'
     )
+    assert classify_response(text) == "native"
+
+
+def test_deeply_nested_json_does_not_raise_and_is_none():
+    # `raw_decode` recurses into nested objects and raises RecursionError
+    # (a RuntimeError subclass, NOT a ValueError) on input like this. The
+    # bake-off probe driver calls classify_response once per model response
+    # and must never abort a whole run because one candidate degenerated
+    # into repetitive output -- a well-known LLM failure mode, and more
+    # likely here since the bake-off is deliberately stress-testing
+    # candidates. Degenerate/deeply-nested input has no valid top-level
+    # tool-call payload, so "none" is correct, not a raised exception.
+    #
+    # NOTE: the finding's repro used depth 5000, but empirically on this
+    # interpreter (CPython 3.13, C-accelerated json scanner) the threshold
+    # where raw_decode flips from a plain JSONDecodeError to a RecursionError
+    # sits at ~10,000 nested opens, not 5,000 -- and it does not track
+    # sys.setrecursionlimit() (confirmed: lowering the limit to 200 does not
+    # move the threshold), so it can't be forced down cheaply. 20,000 gives
+    # 2x margin above the observed threshold so this reliably exercises the
+    # RecursionError path even if another interpreter/platform's threshold
+    # differs somewhat. This test is deliberately not fast (a few seconds):
+    # it is proving crash-safety on genuinely pathological input, which is a
+    # different concern from the O(n^2) brace-dense-but-valid-shaped-text
+    # case covered by the timing test below.
+    text = '{"a":' * 20000 + '1'
+    assert classify_response(text) == "none"
+
+
+def test_large_brace_dense_non_json_text_is_fast():
+    # Synthesize >500KB of CSS-like text -- the normal case for this probe,
+    # since prompts explicitly ask models to write full HTML/CSS/JS demos --
+    # containing no tool call at all. The prior implementation was O(n^2)
+    # here: every failed `raw_decode` attempt at every `{` constructed a
+    # `json.JSONDecodeError`, whose line/column computation is
+    # O(position-in-document), summed over every brace in the document.
+    # Measured on the old code: 5,000 braces/89KB -> 0.048s, 10,000/179KB ->
+    # 0.181s, 20,000/369KB -> 0.721s, 40,000/749KB -> 2.939s (~n^2 growth).
+    # 1.0s is a generous bound: the fast (linear) path should finish in well
+    # under 0.1s even on a loaded machine, but 1.0s is comfortably below
+    # where the old quadratic scan would land on a document this size
+    # (~2.9s at 749KB), so this is not flaky yet still catches a regression
+    # back to O(n^2).
+    rules = []
+    total_len = 0
+    i = 0
+    while total_len < 550_000:
+        rule = f".cls-{i} {{ color: #{i % 999:03x}; margin: {i % 40}px; }}\n"
+        rules.append(rule)
+        total_len += len(rule)
+        i += 1
+    text = "".join(rules)
+    assert len(text) > 500_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 1.0
+
+
+def test_large_payload_with_real_tool_call_near_end_is_native():
+    # Guards against a pre-filter or cap that skips real calls in long
+    # responses: the genuine tool call sits at the very end of a >500KB
+    # brace-dense preamble, which is exactly the case a naive early-exit
+    # cap (e.g. "only scan the first N bytes") would break.
+    rules = []
+    total_len = 0
+    i = 0
+    while total_len < 550_000:
+        rule = f".cls-{i} {{ color: #{i % 999:03x}; margin: {i % 40}px; }}\n"
+        rules.append(rule)
+        total_len += len(rule)
+        i += 1
+    preamble = "".join(rules)
+    text = preamble + (
+        '{"name": "preview_demo", "arguments": {"html": "<p>done</p>"}}'
+    )
+    assert len(text) > 500_000
     assert classify_response(text) == "native"

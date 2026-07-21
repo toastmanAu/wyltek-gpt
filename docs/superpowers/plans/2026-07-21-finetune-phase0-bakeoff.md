@@ -514,6 +514,8 @@ git commit -m "feat: add VRAM ceiling probe for bakeoff candidates"
 Create `finetune/tests/test_classify.py`:
 
 ```python
+import time
+
 from finetune.bakeoff.classify import classify_response
 
 
@@ -616,6 +618,86 @@ def test_native_wins_over_fenced_op_block():
         '<tool_call>{"name":"preview_demo","arguments":{"html":"x"}}</tool_call>'
     )
     assert classify_response(text) == "native"
+
+
+def test_deeply_nested_json_does_not_raise_and_is_none():
+    # `raw_decode` recurses into nested objects and raises RecursionError
+    # (a RuntimeError subclass, NOT a ValueError) on input like this. The
+    # bake-off probe driver calls classify_response once per model response
+    # and must never abort a whole run because one candidate degenerated
+    # into repetitive output -- a well-known LLM failure mode, and more
+    # likely here since the bake-off is deliberately stress-testing
+    # candidates. Degenerate/deeply-nested input has no valid top-level
+    # tool-call payload, so "none" is correct, not a raised exception.
+    #
+    # NOTE: the finding's repro used depth 5000, but empirically on this
+    # interpreter (CPython 3.13, C-accelerated json scanner) the threshold
+    # where raw_decode flips from a plain JSONDecodeError to a RecursionError
+    # sits at ~10,000 nested opens, not 5,000 -- and it does not track
+    # sys.setrecursionlimit() (confirmed: lowering the limit to 200 does not
+    # move the threshold), so it can't be forced down cheaply. 20,000 gives
+    # 2x margin above the observed threshold so this reliably exercises the
+    # RecursionError path even if another interpreter/platform's threshold
+    # differs somewhat. This test is deliberately not fast (a few seconds):
+    # it is proving crash-safety on genuinely pathological input, which is a
+    # different concern from the O(n^2) brace-dense-but-valid-shaped-text
+    # case covered by the timing test below.
+    text = '{"a":' * 20000 + '1'
+    assert classify_response(text) == "none"
+
+
+def test_large_brace_dense_non_json_text_is_fast():
+    # Synthesize >500KB of CSS-like text -- the normal case for this probe,
+    # since prompts explicitly ask models to write full HTML/CSS/JS demos --
+    # containing no tool call at all. The prior implementation was O(n^2)
+    # here: every failed `raw_decode` attempt at every `{` constructed a
+    # `json.JSONDecodeError`, whose line/column computation is
+    # O(position-in-document), summed over every brace in the document.
+    # Measured on the old code: 5,000 braces/89KB -> 0.048s, 10,000/179KB ->
+    # 0.181s, 20,000/369KB -> 0.721s, 40,000/749KB -> 2.939s (~n^2 growth).
+    # 1.0s is a generous bound: the fast (linear) path should finish in well
+    # under 0.1s even on a loaded machine, but 1.0s is comfortably below
+    # where the old quadratic scan would land on a document this size
+    # (~2.9s at 749KB), so this is not flaky yet still catches a regression
+    # back to O(n^2).
+    rules = []
+    total_len = 0
+    i = 0
+    while total_len < 550_000:
+        rule = f".cls-{i} {{ color: #{i % 999:03x}; margin: {i % 40}px; }}\n"
+        rules.append(rule)
+        total_len += len(rule)
+        i += 1
+    text = "".join(rules)
+    assert len(text) > 500_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 1.0
+
+
+def test_large_payload_with_real_tool_call_near_end_is_native():
+    # Guards against a pre-filter or cap that skips real calls in long
+    # responses: the genuine tool call sits at the very end of a >500KB
+    # brace-dense preamble, which is exactly the case a naive early-exit
+    # cap (e.g. "only scan the first N bytes") would break.
+    rules = []
+    total_len = 0
+    i = 0
+    while total_len < 550_000:
+        rule = f".cls-{i} {{ color: #{i % 999:03x}; margin: {i % 40}px; }}\n"
+        rules.append(rule)
+        total_len += len(rule)
+        i += 1
+    preamble = "".join(rules)
+    text = preamble + (
+        '{"name": "preview_demo", "arguments": {"html": "<p>done</p>"}}'
+    )
+    assert len(text) > 500_000
+    assert classify_response(text) == "native"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -640,6 +722,14 @@ form backend/app.py's operations prompt block instructs non-tool-calling
 models to emit (see `_operations_prompt_block`), which frontend/app.js parses
 with `OP_FENCE_RE`. The older unfenced `op:<name> {...}` form is also accepted
 for back-compat with earlier prompt revisions.
+
+This module's inputs are model-generated text -- including brace-dense
+HTML/CSS/JS demo output and, occasionally, degenerate/repetitive output from
+a candidate that is misbehaving. `classify_response` is therefore total: for
+*any* `str` input it returns one of "native", "fallback", "none" and never
+raises. The probe driver (Task 5) calls it once per response in a bake-off
+loop, and a single bad sample must degrade to "none" rather than aborting
+the whole run.
 """
 import json
 import re
@@ -660,9 +750,41 @@ def _is_tool_call_payload(obj: object) -> bool:
 def _payload_from_string(raw: str) -> bool:
     try:
         obj = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError (a RuntimeError subclass, NOT a ValueError) is
+        # what CPython's json scanner raises on deeply-nested input past
+        # its internal depth guard. A `<tool_call>` payload can be
+        # attacker/model-controlled degenerate JSON just as easily as a
+        # bare one, so this needs the same guard as `_has_bare_json_tool_call`.
         return False
     return _is_tool_call_payload(obj)
+
+
+def _looks_like_json_object_start(text: str, idx: int) -> bool:
+    """Cheap O(1) check: could a JSON object plausibly open at ``idx``?
+
+    JSON's grammar for an object is ``'{' ws* ( '"' ... | '}' )`` — after the
+    brace and any whitespace, the next character must be a quote (the first
+    key) or the closing brace (an empty object). Brace-dense non-JSON text
+    (CSS rule blocks, JS control-flow blocks) almost always has an
+    identifier, keyword, or another brace right after the opening brace, so
+    this rejects those positions before ever calling ``raw_decode``.
+
+    That matters because a *failed* ``raw_decode`` constructs a
+    ``json.JSONDecodeError``, whose line/column computation
+    (``doc.count("\\n", 0, pos)``) is O(position-in-document). Summed over
+    every ``{`` in a large brace-dense document, that made the scan O(n^2).
+    Skipping the call entirely for positions that cannot possibly start a
+    JSON object keeps the scan fast on the documents that actually matter
+    for this probe: model-generated HTML/CSS/JS demos, which are brace-dense
+    but rarely have a quote or closing brace immediately after most of
+    their ``{`` characters.
+    """
+    j = idx + 1
+    n = len(text)
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    return j < n and text[j] in ('"', "}")
 
 
 def _has_bare_json_tool_call(text: str) -> bool:
@@ -674,14 +796,29 @@ def _has_bare_json_tool_call(text: str) -> bool:
     silently merges unrelated objects. Trying at each ``{`` with
     ``json.JSONDecoder.raw_decode`` lets the real JSON grammar find each
     object's true extent instead of guessing with a regex.
+
+    Two things can make this scan blow up on adversarial or merely
+    brace-dense input, and both are handled here:
+
+    - Deeply-nested JSON makes ``raw_decode`` raise ``RecursionError``, not
+      ``ValueError`` (`RecursionError` is a `RuntimeError` subclass). Left
+      uncaught this would abort the whole scan for one degenerate response.
+      Caught per-position (not at the top of `classify_response`), a
+      RecursionError at one `{` still lets the scan continue and find a
+      genuine tool call elsewhere in the same text.
+    - Brace-dense non-JSON text (this probe's normal case) makes most `{`
+      positions fail to parse; each failure used to construct a
+      `JSONDecodeError`, which is O(position-in-document), making the whole
+      scan O(n^2). `_looks_like_json_object_start` prunes those positions
+      before `raw_decode` is ever called.
     """
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(text):
-        if ch != "{":
+        if ch != "{" or not _looks_like_json_object_start(text, idx):
             continue
         try:
             obj, _end = decoder.raw_decode(text, idx)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if _is_tool_call_payload(obj):
             return True
@@ -689,17 +826,34 @@ def _has_bare_json_tool_call(text: str) -> bool:
 
 
 def classify_response(text: str) -> str:
+    """Classify ``text`` as "native", "fallback", or "none".
+
+    Total: never raises for any ``str`` input, including empty strings and
+    deeply-nested/degenerate JSON-like text (see module docstring). A
+    RecursionError surfacing from one candidate match is treated as "that
+    match doesn't count", not as an error that aborts classification of the
+    rest of the text — the same input can still classify as native or
+    fallback via a different match elsewhere.
+    """
     if not text:
         return NONE
 
-    for match in _TOOL_CALL_TAG.findall(text):
+    try:
+        tag_matches = _TOOL_CALL_TAG.findall(text)
+    except RecursionError:
+        tag_matches = []
+    for match in tag_matches:
         if _payload_from_string(match):
             return NATIVE
 
     if _has_bare_json_tool_call(text):
         return NATIVE
 
-    if _OP_FENCED.search(text) or _OP_UNFENCED.search(text):
+    try:
+        is_fallback = bool(_OP_FENCED.search(text) or _OP_UNFENCED.search(text))
+    except RecursionError:
+        is_fallback = False
+    if is_fallback:
         return FALLBACK
 
     return NONE
@@ -711,7 +865,7 @@ def classify_response(text: str) -> str:
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_classify.py -v
 ```
 
-Expected: 14 tests PASS.
+Expected: 17 tests PASS.
 
 - [ ] **Step 5: Commit**
 
