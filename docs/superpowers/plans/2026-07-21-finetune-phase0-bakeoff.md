@@ -1818,6 +1818,10 @@ def _write(tmp_path, name, payload):
     (tmp_path / name).write_text(json.dumps(payload))
 
 
+def _write_raw(tmp_path, name, text):
+    (tmp_path / name).write_text(text)
+
+
 def test_collect_merges_probes_per_model(tmp_path):
     _write(tmp_path, "vram_m.json",
            {"model": "m", "probe": "vram", "max_seqlen": 8192})
@@ -1851,6 +1855,103 @@ def test_render_table_includes_headers_and_values():
 def test_render_table_shows_dash_for_missing_probe():
     table = render_table({"m": {"max_seqlen": 8192}})
     assert "—" in table
+
+
+def test_render_table_shows_training_effective_false():
+    table = render_table({"m": {"max_seqlen": 8192, "training_effective": False}})
+    assert "False" in table
+
+
+def test_collect_skips_malformed_json_but_keeps_good_ones(tmp_path, capsys):
+    _write(tmp_path, "vram_a.json", {"model": "a", "probe": "vram", "max_seqlen": 8192})
+    _write_raw(tmp_path, "vram_x.json", '{"model": "x", "max_seqlen": 100')  # truncated
+    _write(tmp_path, "vram_b.json", {"model": "b", "probe": "vram", "max_seqlen": 4096})
+
+    out = collect(tmp_path)
+
+    assert set(out) == {"a", "b"}
+    assert out["a"]["max_seqlen"] == 8192
+    assert out["b"]["max_seqlen"] == 4096
+    err = capsys.readouterr().err
+    assert "vram_x.json" in err
+
+
+def test_collect_skips_non_dict_json(tmp_path, capsys):
+    _write(tmp_path, "vram_a.json", {"model": "a", "probe": "vram", "max_seqlen": 8192})
+    _write_raw(tmp_path, "vram_bad.json", "[1, 2, 3]")
+
+    out = collect(tmp_path)
+
+    assert set(out) == {"a"}
+    err = capsys.readouterr().err
+    assert "vram_bad.json" in err
+
+
+def test_collect_skips_unreadable_file(tmp_path, capsys):
+    # A directory matching the *.json glob pattern: Path.read_text() raises
+    # IsADirectoryError (an OSError subclass) — a portable way to exercise
+    # the OSError branch without relying on permission bits (which root
+    # ignores, making chmod-based tests unreliable in CI/sandboxes).
+    (tmp_path / "vram_dir.json").mkdir()
+    _write(tmp_path, "vram_a.json", {"model": "a", "probe": "vram", "max_seqlen": 8192})
+
+    out = collect(tmp_path)
+
+    assert set(out) == {"a"}
+    err = capsys.readouterr().err
+    assert "vram_dir.json" in err
+
+
+def test_collect_keeps_both_values_on_cross_probe_key_collision(tmp_path, capsys):
+    _write(tmp_path, "reasoning_m.json",
+           {"model": "m", "probe": "reasoning", "n": 100, "retention": 0.9})
+    _write(tmp_path, "toolcall_m.json",
+           {"model": "m", "probe": "toolcall", "n": 40, "native_rate": 0.75})
+
+    out = collect(tmp_path)
+
+    values = set(out["m"].values())
+    # Both original "n" values must survive somewhere in the merged entry —
+    # one under the plain "n" key, the other under a probe-namespaced key.
+    assert 100 in values
+    assert 40 in values
+    namespaced = [k for k in out["m"] if k != "n" and k.endswith("_n")]
+    assert namespaced, f"expected a probe-namespaced 'n' key, got {out['m']!r}"
+    assert out["m"]["native_rate"] == 0.75
+    assert out["m"]["retention"] == 0.9
+    err = capsys.readouterr().err
+    assert "'n'" in err or '"n"' in err or " n " in err
+
+
+def test_collect_identical_colliding_values_do_not_namespace(tmp_path, capsys):
+    _write(tmp_path, "reasoning_m.json",
+           {"model": "m", "probe": "reasoning", "n": 100})
+    _write(tmp_path, "toolcall_m.json",
+           {"model": "m", "probe": "toolcall", "n": 100})
+
+    out = collect(tmp_path)
+
+    assert out["m"]["n"] == 100
+    assert not [k for k in out["m"] if k != "n" and k.endswith("_n")]
+    err = capsys.readouterr().err
+    assert err == ""
+
+
+def test_render_table_regression_zero_and_false_are_not_dashes():
+    # Locks in the fix a prior review verified: `vals.get(c, "—")` must
+    # distinguish ABSENT (dash) from FALSY-BUT-PRESENT (literal 0.0/False).
+    table = render_table({
+        "m": {
+            "max_seqlen": 8192,
+            "native_rate": 0.0,
+            "training_effective": False,
+        }
+    })
+    assert "0.0" in table
+    assert "False" in table
+    row = [line for line in table.splitlines() if line.startswith("| m ")][0]
+    assert "—" in row  # the still-missing columns should show as dashes
+    assert row.count("—") == 3  # accuracy_before, accuracy_after, retention
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1869,23 +1970,79 @@ Create `finetune/bakeoff/report.py`:
 """Aggregate probe results into a comparison table."""
 import argparse
 import json
+import sys
 from pathlib import Path
 
 DEFAULT_RESULTS = Path(__file__).parent / "results"
-COLUMNS = ["max_seqlen", "native_rate", "accuracy_before", "accuracy_after", "retention"]
+COLUMNS = ["max_seqlen", "native_rate", "accuracy_before", "accuracy_after", "retention",
+           "training_effective"]
 
 
 def collect(results_dir: Path) -> dict[str, dict]:
+    """Merge per-model probe JSON files from results_dir into one dict per model.
+
+    Resilient to a run that produced a partially-written or otherwise bad file:
+    such files are skipped with a warning on stderr rather than aborting the
+    whole aggregation (a single truncated file must not hide every model's
+    results after a run that may have taken hours).
+
+    Cross-probe key collisions (two files disagreeing on the meaning of the
+    same key, e.g. "n") are preserved rather than silently overwritten: the
+    value about to be shadowed is stashed under a probe-namespaced key
+    (`<probe>_<key>`) before the new value takes the plain key, and a warning
+    is printed. Identical colliding values are harmless and produce no
+    namespaced key or warning.
+    """
     merged: dict[str, dict] = {}
+    # Per-model, per-key: which probe most recently supplied the current value.
+    # Needed so a later collision can be attributed to the right probe prefix.
+    sources: dict[str, dict[str, str]] = {}
+
     for path in sorted(Path(results_dir).glob("*.json")):
-        data = json.loads(path.read_text())
+        try:
+            raw = path.read_text()
+        except OSError as exc:
+            print(f"warning: skipping {path}: could not read file ({exc})", file=sys.stderr)
+            continue
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"warning: skipping {path}: malformed JSON ({exc})", file=sys.stderr)
+            continue
+
+        if not isinstance(data, dict):
+            print(
+                f"warning: skipping {path}: expected a JSON object at the top level, "
+                f"got {type(data).__name__}",
+                file=sys.stderr,
+            )
+            continue
+
         model = data.get("model")
         if not model:
             continue
+
+        probe_name = data.get("probe") or path.stem
         entry = merged.setdefault(model, {})
+        entry_sources = sources.setdefault(model, {})
+
         for k, v in data.items():
-            if k not in ("model", "probe"):
-                entry[k] = v
+            if k in ("model", "probe"):
+                continue
+            if k in entry and entry[k] != v:
+                prev_probe = entry_sources.get(k, "unknown")
+                namespaced_key = f"{prev_probe}_{k}"
+                print(
+                    f"warning: {path.name}: key '{k}' means different things across "
+                    f"probes for model '{model}' ({prev_probe}={entry[k]!r} vs "
+                    f"{probe_name}={v!r}); preserving prior value as '{namespaced_key}'",
+                    file=sys.stderr,
+                )
+                entry[namespaced_key] = entry[k]
+            entry[k] = v
+            entry_sources[k] = probe_name
+
     return merged
 
 
@@ -1916,13 +2073,15 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
+Note: `collect()` was hardened after an IMPORTANT-severity code review found two live bugs — a single malformed/unreadable probe file aborted aggregation for every model via an unhandled `json.loads`/`read_text` exception, and a flat `entry[k] = v` merge silently clobbered the `n` key across the `toolcall_` (tool-call prompt count) and `reasoning_` (GSM8K row count) probes with no warning. The version above is the post-fix implementation: bad files are skipped with a stderr warning (`OSError`, `JSONDecodeError`, and non-dict top-level JSON all handled), and cross-probe key collisions preserve the about-to-be-shadowed value under a `<probe>_<key>` namespaced key (with a warning) instead of dropping it — identical colliding values produce neither.
+
 - [ ] **Step 4: Run the full test suite**
 
 ```bash
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/ -v
 ```
 
-Expected: all 45 tests PASS across the eight test files (4 schema_bridge + 5 search + 3 vram_probe + 9 classify + 5 toolcall_probe + 9 score + 5 reasoning_probe + 5 report).
+Expected: all 79 tests PASS across the eight test files (4 schema_bridge + 9 search + 3 vram_probe + 26 classify + 5 toolcall_probe + 9 score + 11 reasoning_probe + 12 report).
 
 - [ ] **Step 5: Commit**
 
