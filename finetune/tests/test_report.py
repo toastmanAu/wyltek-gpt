@@ -1,5 +1,5 @@
 import json
-from finetune.bakeoff.report import collect, render_table
+from finetune.bakeoff.report import COLUMNS, collect, loss_delta, render_table
 
 
 def _write(tmp_path, name, payload):
@@ -139,4 +139,93 @@ def test_render_table_regression_zero_and_false_are_not_dashes():
     assert "False" in table
     row = [line for line in table.splitlines() if line.startswith("| m ")][0]
     assert "—" in row  # the still-missing columns should show as dashes
-    assert row.count("—") == 3  # accuracy_before, accuracy_after, retention
+    # Derived from COLUMNS rather than hardcoded, so adding a column extends
+    # this guarantee instead of breaking it: EVERY absent column renders a
+    # dash, and the two falsy-but-present ones above render literally.
+    present = {"max_seqlen", "native_rate", "training_effective"}
+    assert row.count("—") == len([c for c in COLUMNS if c not in present])
+
+
+def test_collect_skips_invalid_utf8_but_keeps_good_ones(tmp_path, capsys):
+    # UnicodeDecodeError subclasses ValueError, NOT OSError, so an `except
+    # OSError` around read_text() misses it entirely. A write truncated
+    # mid-multi-byte-UTF-8 sequence is exactly the OOM/Ctrl-C scenario in the
+    # threat model, and it used to kill the whole report.
+    _write(tmp_path, "vram_a.json", {"model": "a", "probe": "vram", "max_seqlen": 8192})
+    (tmp_path / "vram_bytes.json").write_bytes(b"\x00\x01\x02\xff\xfe")
+
+    out = collect(tmp_path)
+
+    assert set(out) == {"a"}
+    assert out["a"]["max_seqlen"] == 8192
+    err = capsys.readouterr().err
+    assert "vram_bytes.json" in err
+
+
+def test_collect_skips_deeply_nested_json(tmp_path, capsys):
+    # Deeply-nested but otherwise VALID JSON blows the recursion limit inside
+    # json.loads, raising RecursionError (not JSONDecodeError).
+    _write(tmp_path, "vram_a.json", {"model": "a", "probe": "vram", "max_seqlen": 8192})
+    _write_raw(tmp_path, "vram_deep.json", "[" * 200000 + "]" * 200000)
+
+    out = collect(tmp_path)
+
+    assert set(out) == {"a"}
+    err = capsys.readouterr().err
+    assert "vram_deep.json" in err
+
+
+def test_collect_same_probe_name_reuse_keeps_every_differing_value(tmp_path, capsys):
+    # A re-run probe can leave two differing files for one model. The old
+    # namespacing wrote `<probe>_<key>` without checking occupancy, so a second
+    # collision clobbered the first and a value vanished silently.
+    _write(tmp_path, "dup_1.json", {"model": "m", "probe": "dup", "n": 1})
+    _write(tmp_path, "dup_2.json", {"model": "m", "probe": "dup", "n": 2})
+    _write(tmp_path, "dup_3.json", {"model": "m", "probe": "dup", "n": 3})
+
+    out = collect(tmp_path)
+
+    values = set(out["m"].values())
+    assert {1, 2, 3} <= values, f"a differing value was lost: {out['m']!r}"
+    err = capsys.readouterr().err
+    assert "dup" in err
+
+
+def test_loss_delta_normal():
+    assert loss_delta(2.5, 1.5) == 1.0
+
+
+def test_loss_delta_negative_when_loss_rose():
+    assert loss_delta(1.0, 1.5) == -0.5
+
+
+def test_loss_delta_none_when_either_missing():
+    assert loss_delta(None, 1.5) is None
+    assert loss_delta(2.5, None) is None
+    assert loss_delta(None, None) is None
+
+
+def test_collect_derives_loss_delta(tmp_path):
+    _write(tmp_path, "reasoning_m.json",
+           {"model": "m", "probe": "reasoning", "loss_start": 2.5, "loss_end": 1.5})
+    out = collect(tmp_path)
+    assert out["m"]["loss_delta"] == 1.0
+
+
+def test_collect_omits_loss_delta_when_losses_missing(tmp_path):
+    _write(tmp_path, "vram_m.json", {"model": "m", "probe": "vram", "max_seqlen": 8192})
+    out = collect(tmp_path)
+    assert "loss_delta" not in out["m"]
+
+
+def test_render_table_includes_diagnostic_columns():
+    # loss_delta / unparseable_* are written to JSON and printed at run time,
+    # but the TABLE is what drives the decision weeks later.
+    table = render_table({
+        "m": {"loss_delta": 0.8, "unparseable_before": 2, "unparseable_after": 31}
+    })
+    assert "loss_delta" in table
+    assert "unparseable_before" in table
+    assert "unparseable_after" in table
+    assert "0.8" in table
+    assert "31" in table

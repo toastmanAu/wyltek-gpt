@@ -76,3 +76,13 @@ def test_never_probes_same_value_twice_with_threshold():
 def test_non_aligned_lo_raises_value_error():
     with pytest.raises(ValueError):
         find_max_seqlen(lambda n: True, lo=600, hi=16384, step=512)
+
+
+def test_hi_below_lo_raises():
+    # Guards a mis-specified sweep (--hi below --lo). The documented contract
+    # is "largest multiple of step in [lo, hi]"; when hi < lo that range is
+    # empty, so returning `lo` silently reported a value OUTSIDE the range the
+    # caller asked for. Consistent with the existing `lo % step` guard: a bad
+    # sweep spec must fail loudly rather than waste GPU hours.
+    with pytest.raises(ValueError):
+        find_max_seqlen(lambda n: True, lo=2048, hi=512, step=512)

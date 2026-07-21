@@ -22,9 +22,17 @@ def find_max_seqlen(
     invariant (and the "largest multiple of `step`" contract) only holds
     for an aligned `lo`, and silently rounding would risk wasting hours of
     GPU time on a mis-specified sweep.
+
+    Raises `ValueError` if `hi < lo`, for the same reason: the range
+    [lo, hi] is empty, so there is no valid answer to return. The old
+    behaviour returned `lo` — a value OUTSIDE the range the caller asked
+    about, and one that looks like a successful measurement. Both `lo` and
+    `hi` are CLI-exposed (--lo/--hi), so this fails loudly instead.
     """
     if lo % step != 0:
         raise ValueError(f"lo={lo} must be a multiple of step={step}")
+    if hi < lo:
+        raise ValueError(f"hi={hi} must be >= lo={lo}; the range [lo, hi] is empty")
 
     cache: dict[int, bool] = {}
 

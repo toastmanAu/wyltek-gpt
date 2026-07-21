@@ -3,7 +3,8 @@
 Feeds html_demo tool schemas plus a demo request through the model's chat
 template and classifies the response. This is the metric that most directly
 predicts usefulness in wyltek-gpt: a model stuck on the op: fallback path
-(backend/app.py:477) is a model the app has to work around.
+(backend/app.py:172 and backend/app.py:498) is a model the app has to work
+around.
 """
 import argparse
 import json
@@ -11,7 +12,9 @@ from collections import Counter
 from pathlib import Path
 
 from finetune.bakeoff.classify import classify_response
-from finetune.bakeoff.vram_probe import slugify
+from finetune.bakeoff.vram_probe import slugify, warn_if_above_measured_ceiling
+
+DEFAULT_MAX_SEQLEN = 4096
 
 HERE = Path(__file__).parent
 DEFAULT_OUT = HERE / "results"
@@ -36,7 +39,8 @@ def summarize(labels: list[str]) -> dict:
 
 
 def generate(model_name: str, prompts: list[str], tools: list[dict],
-             max_seqlen: int = 4096, max_new_tokens: int = 512) -> list[str]:
+             max_seqlen: int = DEFAULT_MAX_SEQLEN,
+             max_new_tokens: int = 512) -> list[str]:
     from unsloth import FastLanguageModel
 
     model, tok = FastLanguageModel.from_pretrained(
@@ -70,6 +74,8 @@ def main() -> int:
 
     prompts = load_prompts(args.prompts)
     tools = json.loads(args.schemas.read_text())
+    # Probe 0A's measured ceiling is not otherwise wired into this probe.
+    warn_if_above_measured_ceiling(args.model, DEFAULT_MAX_SEQLEN, args.out)
     texts = generate(args.model, prompts, tools)
     labels = [classify_response(t) for t in texts]
     result = {"model": args.model, "probe": "toolcall", **summarize(labels)}

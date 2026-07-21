@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 
 from finetune.bakeoff.score import extract_answer, is_correct
-from finetune.bakeoff.vram_probe import slugify
+from finetune.bakeoff.vram_probe import slugify, warn_if_above_measured_ceiling
 
 DEFAULT_OUT = Path(__file__).parent / "results"
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -33,9 +33,13 @@ TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 # different bit of "style" (canvas animation, CSS grid, SVG, transitions,
 # flex layout, gradients) so the smoke LoRA applies gradient pressure in the
 # SHAPE of a real style corpus rather than memorizing one repeated string.
-# Kept digit-light on purpose (see module docstring / Finding 4): a
-# digit-dense corpus risks `extract_answer`'s last-number heuristic grabbing
-# a memorized corpus digit instead of the model's actual GSM8K conclusion.
+# Kept AS digit-light as the markup allows (see module docstring / Finding 4):
+# a digit-dense corpus risks `extract_answer`'s last-number heuristic grabbing
+# a memorized corpus digit instead of the model's actual GSM8K conclusion. Note
+# this is a tendency, not a uniform property — sample 0 (the canvas
+# bouncing-ball demo) carries notably more digits than the other five because
+# the animation maths needs them. That is the sample to suspect first if
+# `unparseable_after` jumps or accuracy_after looks oddly low.
 SMOKE_SAMPLES = [
     "<!DOCTYPE html><html><head><style>body{margin:0;background:navy}"
     "canvas{display:block}</style></head><body><canvas id=c></canvas>"
@@ -197,10 +201,24 @@ def smoke_train(model, tok, steps: int, max_seqlen: int):
     samples = [{"text": formatted[i % len(formatted)]} for i in range(n_rows)]
 
     trainer = SFTTrainer(
-        model=model, tokenizer=tok, train_dataset=Dataset.from_list(samples),
+        # `processing_class`, NOT `tokenizer`: TRL renamed this parameter and
+        # the installed trl (0.23.1) has no `tokenizer` parameter at all. Under
+        # bare TRL that is an immediate TypeError; under unsloth's patched
+        # SFTTrainer (which does accept **kwargs) it is worse — the tokenizer
+        # is silently swallowed. Either way this fires only AFTER the ~100
+        # GSM8K generations of the before-pass, so getting it wrong wastes a
+        # model download plus a full scoring run.
+        model=model, processing_class=tok, train_dataset=Dataset.from_list(samples),
+        # `max_length` is what TRL actually truncates on; `max_seq_length` is
+        # stored inert (it reads back as the value we set while max_length
+        # quietly stays at its 1024 default). Passing only max_seq_length made
+        # --max-seqlen a lie: the ceiling probe 0A measures would never be the
+        # length 0B trains at. Both are passed — max_seq_length is accepted
+        # under the unsloth-patched SFTConfig this probe always runs beneath.
         args=SFTConfig(max_steps=steps, per_device_train_batch_size=1,
                        gradient_accumulation_steps=1, learning_rate=2e-4,
-                       max_seq_length=max_seqlen, logging_steps=1,
+                       max_length=max_seqlen, max_seq_length=max_seqlen,
+                       logging_steps=1,
                        output_dir="/tmp/bakeoff_smoke", report_to="none"),
     )
     trainer.train()
@@ -219,6 +237,10 @@ def main() -> int:
     ap.add_argument("--max-seqlen", type=int, default=2048)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
+
+    # Probe 0A's measured ceiling is not otherwise wired into this probe: the
+    # --max-seqlen default (2048) knows nothing about what 0A found.
+    warn_if_above_measured_ceiling(args.model, args.max_seqlen, args.out)
 
     from unsloth import FastLanguageModel
 

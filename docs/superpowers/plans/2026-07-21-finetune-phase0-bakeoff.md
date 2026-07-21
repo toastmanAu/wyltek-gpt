@@ -120,7 +120,7 @@ backend code. The generated JSON is the only bridge between the two
 environments; nothing in bakeoff/ ever imports backend directly.
 
 Usage (from repo root):
-    .venv/bin/python finetune/bakeoff/dump_schemas.py
+    .venv/bin/python -m finetune.bakeoff.dump_schemas
 """
 import json
 import sys
@@ -166,16 +166,16 @@ They never import each other. `bakeoff/schemas/html_demo_tools.json` is the brid
 
 ```bash
 # 1. Regenerate the schema bridge (only when html_demo tools change)
-.venv/bin/python finetune/bakeoff/dump_schemas.py
+.venv/bin/python -m finetune.bakeoff.dump_schemas
 
 # 2. Probes (GPU must be otherwise idle)
 UV=~/.unsloth/studio/unsloth_studio/bin/python
-$UV finetune/bakeoff/vram_probe.py      --model unsloth/gemma-4-12b-it
-$UV finetune/bakeoff/toolcall_probe.py  --model unsloth/gemma-4-12b-it
-$UV finetune/bakeoff/reasoning_probe.py --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.vram_probe      --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.toolcall_probe  --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.reasoning_probe --model unsloth/gemma-4-12b-it
 
 # 3. Report
-$UV finetune/bakeoff/report.py
+$UV -m finetune.bakeoff.report
 ```
 
 Results land in `bakeoff/results/` (gitignored).
@@ -185,7 +185,7 @@ Results land in `bakeoff/results/` (gitignored).
 
 ```bash
 cd ~/local-chatbot
-.venv/bin/python finetune/bakeoff/dump_schemas.py
+.venv/bin/python -m finetune.bakeoff.dump_schemas
 ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_schema_bridge.py -v
 ```
 
@@ -209,7 +209,7 @@ git commit -m "feat: scaffold fine-tune bakeoff with html_demo schema bridge"
 - Test: `finetune/tests/test_search.py`
 
 **Interfaces:**
-- Produces: `find_max_seqlen(fits, lo=512, hi=16384, step=512) -> int` where `fits: Callable[[int], bool]` returns True if that sequence length trains without OOM. Returns the largest multiple of `step` that fits, or `0` if even `lo` fails. Task 3 (`vram_probe.py`) supplies the real `fits`.
+- Produces: `find_max_seqlen(fits, lo=512, hi=16384, step=512) -> int` where `fits: Callable[[int], bool]` returns True if that sequence length trains without OOM. Returns the largest multiple of `step` that fits, or `0` if even `lo` fails. Raises `ValueError` if `lo` is not a multiple of `step`, or if `hi < lo` (an empty range — returning `lo` there reported a value outside the requested range, and both bounds are CLI-exposed via `--lo`/`--hi`). Task 3 (`vram_probe.py`) supplies the real `fits`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1974,24 +1974,53 @@ import sys
 from pathlib import Path
 
 DEFAULT_RESULTS = Path(__file__).parent / "results"
+# Decision columns first, then the diagnostics that tell a reader whether the
+# decision columns can be trusted at all (see `loss_delta` and the Task 9
+# interpretation checklist in finetune/README.md).
 COLUMNS = ["max_seqlen", "native_rate", "accuracy_before", "accuracy_after", "retention",
-           "training_effective"]
+           "training_effective", "loss_delta", "unparseable_before", "unparseable_after"]
+
+
+def loss_delta(loss_start: float | None, loss_end: float | None) -> float | None:
+    """How far loss actually fell during the smoke LoRA (start - end).
+
+    `training_effective` is only a boolean floor: it says loss moved DOWN, not
+    how far. Two candidates can both report True having received wildly
+    different training pressure — and a 27B absorbs far less change than a 12B
+    under identical LoRA settings, which confounds retention with model size.
+    A visible delta is what lets a human notice that the candidates were not
+    comparably trained before ranking them on retention.
+
+    Returns None when either reading is missing; the caller omits the key in
+    that case so the table renders an unambiguous dash.
+    """
+    if loss_start is None or loss_end is None:
+        return None
+    return round(loss_start - loss_end, 4)
 
 
 def collect(results_dir: Path) -> dict[str, dict]:
     """Merge per-model probe JSON files from results_dir into one dict per model.
 
-    Resilient to a run that produced a partially-written or otherwise bad file:
-    such files are skipped with a warning on stderr rather than aborting the
-    whole aggregation (a single truncated file must not hide every model's
-    results after a run that may have taken hours).
+    Contract: NEVER let one bad file kill the report. Any file that cannot be
+    read, decoded, parsed, or that is not a JSON object is skipped with a
+    warning on stderr naming the file and the reason. A single truncated file
+    must not hide every model's results after a run that may have taken hours,
+    so the exception net here is deliberately broad rather than clever —
+    unreadable bytes (OSError), invalid UTF-8 (UnicodeDecodeError, which
+    subclasses ValueError and so is NOT caught by an `except OSError`),
+    malformed JSON (JSONDecodeError), and deeply-nested-but-valid JSON
+    (RecursionError) are all merely "this file is unusable".
 
-    Cross-probe key collisions (two files disagreeing on the meaning of the
-    same key, e.g. "n") are preserved rather than silently overwritten: the
-    value about to be shadowed is stashed under a probe-namespaced key
-    (`<probe>_<key>`) before the new value takes the plain key, and a warning
-    is printed. Identical colliding values are harmless and produce no
-    namespaced key or warning.
+    Key collisions (two files disagreeing on the value of the same key, e.g.
+    "n" from the toolcall and reasoning probes) are preserved rather than
+    silently overwritten: the value about to be shadowed is stashed under a
+    `<probe>_<key>` key before the new value takes the plain key, and a warning
+    is printed. If that namespaced key is itself already occupied — which
+    happens when the SAME probe is re-run and leaves two differing files for
+    one model — a numeric suffix is appended so no differing value is ever
+    dropped. Identical colliding values are harmless and produce no namespaced
+    key or warning.
     """
     merged: dict[str, dict] = {}
     # Per-model, per-key: which probe most recently supplied the current value.
@@ -2000,15 +2029,17 @@ def collect(results_dir: Path) -> dict[str, dict]:
 
     for path in sorted(Path(results_dir).glob("*.json")):
         try:
-            raw = path.read_text()
-        except OSError as exc:
-            print(f"warning: skipping {path}: could not read file ({exc})", file=sys.stderr)
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"warning: skipping {path}: could not read file "
+                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
             continue
 
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            print(f"warning: skipping {path}: malformed JSON ({exc})", file=sys.stderr)
+        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+            print(f"warning: skipping {path}: malformed JSON "
+                  f"({type(exc).__name__}: {exc})", file=sys.stderr)
             continue
 
         if not isinstance(data, dict):
@@ -2032,16 +2063,37 @@ def collect(results_dir: Path) -> dict[str, dict]:
                 continue
             if k in entry and entry[k] != v:
                 prev_probe = entry_sources.get(k, "unknown")
+                # Guard the namespaced slot: re-running the SAME probe leaves
+                # two differing files under one probe name, and an unguarded
+                # assignment would clobber the first collision's stashed value
+                # (three files with n=1,2,3 used to yield {n:3, dup_n:2} —
+                # the 1 gone, silently). Suffix until we find a free slot.
                 namespaced_key = f"{prev_probe}_{k}"
+                if namespaced_key in entry:
+                    suffix = 2
+                    while f"{namespaced_key}_{suffix}" in entry:
+                        suffix += 1
+                    namespaced_key = f"{namespaced_key}_{suffix}"
+                    note = (f"repeat collision under the same probe name "
+                            f"'{prev_probe}' — this usually means that probe "
+                            f"was re-run and left more than one result file")
+                else:
+                    note = "different probes disagree on this key"
                 print(
-                    f"warning: {path.name}: key '{k}' means different things across "
-                    f"probes for model '{model}' ({prev_probe}={entry[k]!r} vs "
-                    f"{probe_name}={v!r}); preserving prior value as '{namespaced_key}'",
+                    f"warning: {path.name}: key '{k}' collides for model "
+                    f"'{model}' ({prev_probe}={entry[k]!r} vs "
+                    f"{probe_name}={v!r}); {note}; preserving prior value as "
+                    f"'{namespaced_key}'",
                     file=sys.stderr,
                 )
                 entry[namespaced_key] = entry[k]
             entry[k] = v
             entry_sources[k] = probe_name
+
+    for entry in merged.values():
+        delta = loss_delta(entry.get("loss_start"), entry.get("loss_end"))
+        if delta is not None:
+            entry["loss_delta"] = delta
 
     return merged
 
@@ -2073,7 +2125,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-Note: `collect()` was hardened after an IMPORTANT-severity code review found two live bugs — a single malformed/unreadable probe file aborted aggregation for every model via an unhandled `json.loads`/`read_text` exception, and a flat `entry[k] = v` merge silently clobbered the `n` key across the `toolcall_` (tool-call prompt count) and `reasoning_` (GSM8K row count) probes with no warning. The version above is the post-fix implementation: bad files are skipped with a stderr warning (`OSError`, `JSONDecodeError`, and non-dict top-level JSON all handled), and cross-probe key collisions preserve the about-to-be-shadowed value under a `<probe>_<key>` namespaced key (with a warning) instead of dropping it — identical colliding values produce neither.
+Note: `collect()` was hardened across two review rounds. Round one: a single malformed/unreadable probe file aborted aggregation for every model, and a flat `entry[k] = v` merge silently clobbered the `n` key across the `toolcall_` and `reasoning_` probes. Round two (final): `except OSError` still missed `UnicodeDecodeError` (a `ValueError` subclass) so a write truncated mid-multi-byte-UTF-8 sequence — precisely the OOM/Ctrl-C case in the threat model — reproduced the original catastrophic symptom via an uncovered path; deeply-nested-but-valid JSON raised `RecursionError` for the same reason; and the collision namespacing wrote `<probe>_<key>` without checking occupancy, so re-running the SAME probe dropped a value silently (three files with `n` = 1, 2, 3 yielded `{n: 3, dup_n: 2}` — the 1 gone). The documented contract is now: **never let one bad file kill the report**. The version above also adds the derived `loss_delta` column and the `unparseable_*` diagnostics.
+
+`loss_delta` is a small pure function (`loss_start - loss_end`, `None` when either is missing) so it is unit-testable; `collect()` derives it per model and omits the key entirely when it cannot be computed, so the table shows an unambiguous dash. `render_table` deliberately keeps `vals.get(c, "—")` rather than an `or "—"` pattern: that is what distinguishes ABSENT from FALSY-BUT-PRESENT, so `0.0` and `False` render literally.
 
 - [ ] **Step 4: Run the full test suite**
 
@@ -2081,7 +2135,9 @@ Note: `collect()` was hardened after an IMPORTANT-severity code review found two
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/ -v
 ```
 
-Expected: all 79 tests PASS across the eight test files (4 schema_bridge + 9 search + 3 vram_probe + 26 classify + 5 toolcall_probe + 9 score + 11 reasoning_probe + 12 report).
+Expected: all 95 tests PASS across the eight test files (4 schema_bridge + 10 search + 9 vram_probe + 26 classify + 5 toolcall_probe + 9 score + 11 reasoning_probe + 21 report).
+
+The count rose from 79 after a final combined review round: `search` gained the `hi < lo` guard test; `vram_probe` gained six covering the measured-ceiling lookup and the 0A-ceiling warning; `report` gained nine covering invalid-UTF-8 / deeply-nested-JSON skips, same-probe-name collision preservation, and the `loss_delta` column. No test was deleted — the falsy-vs-absent render regression test was EXTENDED to derive its dash count from `COLUMNS` so the added columns strengthen it rather than break it.
 
 - [ ] **Step 5: Commit**
 
@@ -2108,14 +2164,37 @@ rocm-smi --showmemuse | grep -i "VRAM%"
 
 Expected: VRAM% at or near idle (~12%, desktop only). If higher, find and stop the holder before proceeding — a probe that OOMs on someone else's memory is a wasted measurement.
 
+The card is 24 GB but ~3 GB is held by the desktop compositor, so the real budget is **~21 GB usable**. `vram_probe` warns below that threshold.
+
+**Note on invocation:** every probe below runs as a **module** (`python -m finetune.bakeoff.<name>`) from the repo root. Script form (`python finetune/bakeoff/vram_probe.py`) puts `finetune/bakeoff/` on `sys.path` rather than the repo root, so the absolute `from finetune.bakeoff...` imports fail with `ModuleNotFoundError` before any work starts.
+
+- [ ] **Step 1b: Pre-check that the tool schemas actually reach the prompt**
+
+Before trusting any 0C number, for EACH candidate:
+
+```bash
+cd ~/local-chatbot
+UV=~/.unsloth/studio/unsloth_studio/bin/python
+$UV -c "
+from transformers import AutoTokenizer
+import json
+tok = AutoTokenizer.from_pretrained('unsloth/gemma-4-12b-it')
+tools = json.load(open('finetune/bakeoff/schemas/html_demo_tools.json'))
+print(tok.apply_chat_template([{'role':'user','content':'make a demo'}],
+                              tools=tools, add_generation_prompt=True, tokenize=False))
+"
+```
+
+Expected: the tool schemas appear verbatim in the rendered prompt text. Some tokenizer chat templates **SILENTLY IGNORE the `tools` kwarg** when their Jinja never references it — and when that happens `native_rate` reads ~0 for reasons that have nothing to do with model ability. If the schemas are absent, that candidate's 0C number is meaningless and must be recorded as "template does not support tools" rather than as a low score.
+
 - [ ] **Step 2: Run all three probes for gemma-4-12b-it**
 
 ```bash
 cd ~/local-chatbot
 UV=~/.unsloth/studio/unsloth_studio/bin/python
-$UV finetune/bakeoff/vram_probe.py      --model unsloth/gemma-4-12b-it
-$UV finetune/bakeoff/toolcall_probe.py  --model unsloth/gemma-4-12b-it
-$UV finetune/bakeoff/reasoning_probe.py --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.vram_probe      --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.toolcall_probe  --model unsloth/gemma-4-12b-it
+$UV -m finetune.bakeoff.reasoning_probe --model unsloth/gemma-4-12b-it
 ```
 
 Expected: three JSON files in `finetune/bakeoff/results/`.
@@ -2125,9 +2204,9 @@ Expected: three JSON files in `finetune/bakeoff/results/`.
 ```bash
 cd ~/local-chatbot
 UV=~/.unsloth/studio/unsloth_studio/bin/python
-$UV finetune/bakeoff/vram_probe.py      --model unsloth/Qwen3.6-27B
-$UV finetune/bakeoff/toolcall_probe.py  --model unsloth/Qwen3.6-27B
-$UV finetune/bakeoff/reasoning_probe.py --model unsloth/Qwen3.6-27B --max-seqlen 2048
+$UV -m finetune.bakeoff.vram_probe      --model unsloth/Qwen3.6-27B
+$UV -m finetune.bakeoff.toolcall_probe  --model unsloth/Qwen3.6-27B
+$UV -m finetune.bakeoff.reasoning_probe --model unsloth/Qwen3.6-27B --max-seqlen 2048
 ```
 
 Expected: three more JSON files. If the 27B VRAM probe returns `max_seqlen=0`, that is a **finding, not a failure** — record it and stop testing 27B.
@@ -2135,10 +2214,20 @@ Expected: three more JSON files. If the 27B VRAM probe returns `max_seqlen=0`, t
 - [ ] **Step 4: Generate the comparison table**
 
 ```bash
-cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python finetune/bakeoff/report.py
+cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m finetune.bakeoff.report
 ```
 
-Expected: a markdown table with one row per model.
+Expected: a markdown table with one row per model. Columns: `max_seqlen`, `native_rate`, `accuracy_before`, `accuracy_after`, `retention`, `training_effective`, `loss_delta`, `unparseable_before`, `unparseable_after`. A `—` means that probe did not report the value; `0.0` / `False` render literally and mean the value WAS measured.
+
+- [ ] **Step 4b: Interpret the table (read before choosing)**
+
+Apply these rules in order — several of them invert a naive reading:
+
+1. **Rank on `retention`, never on raw accuracy.** The GSM8K "last number wins" heuristic penalises verbose models. That bias cancels within one model's own before/after, but it does NOT cancel across models, so `accuracy_before` is not comparable between candidates.
+2. **Floor on rule 1: ignore `retention` when `accuracy_before` is below ~0.10.** `retention(0, 0)` returns 1.0 by design, so a model scoring 0.0 both times posts a perfect-looking retention having demonstrated nothing — it would "win" a naive retention-only ranking. Below the floor the ratio is noise over noise.
+3. **`training_effective: False` voids that row's retention entirely.** It means the smoke LoRA changed nothing, so no degradation was measured. Retention 1.0 there means "not measured", not "held its shape".
+4. **Compare `loss_delta` across candidates before comparing retention.** `training_effective` is only a boolean floor (loss went down), not how far. Two rows can both be True with wildly different deltas, and a 27B absorbs far less change than a 12B under identical LoRA settings — so retention is confounded with model size unless the candidates took comparable training pressure.
+5. **A jump from `unparseable_before` to `unparseable_after` is the signature of smoke-corpus bleed** poisoning the scorer, not a reasoning regression. Inspect raw generations before believing `accuracy_after`.
 
 - [ ] **Step 5: Write up the decision**
 
