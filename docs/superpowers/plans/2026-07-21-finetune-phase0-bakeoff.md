@@ -1677,9 +1677,18 @@ git commit -m "feat: add GSM8K answer extraction and scoring"
 
 **Interfaces:**
 - Consumes: `extract_answer`, `is_correct` (Task 6); `slugify` (Task 3).
-- Produces: `retention(before: float, after: float) -> float` — `after / before` rounded to 3 places, `1.0` when `before == 0`. Written to `results/reasoning_<slug>.json` with keys `model`, `probe`, `n`, `accuracy_before`, `accuracy_after`, `retention`. Task 8 reads it.
+- Produces: `retention(before: float, after: float) -> float` — `after / before` rounded to 3 places, `1.0` when `before == 0` (asymmetric zero, i.e. `before == 0` and `after > 0`, hits the same guard). `training_effective(loss_start, loss_end) -> bool` — pure helper, `True` only when both values are present and `loss_end < loss_start`. Written to `results/reasoning_<slug>.json` with keys `model`, `probe`, `n`, `accuracy_before`, `accuracy_after`, `retention`, `loss_start`, `loss_end`, `training_effective`, `unparseable_before`, `unparseable_after`. Task 8 reads it.
 
 This is the measurement that decides the bake-off: **degradation per unit of style training**, not raw capability. A stronger base that degrades faster can lose to a weaker one that holds its shape.
+
+**Post-review revision (2026-07-21):** the first pass of this probe had one CRITICAL and three IMPORTANT methodological bugs, found before the bake-off ran for real:
+
+1. **CRITICAL — training may not have been happening at all.** `score()` called `FastLanguageModel.for_inference(model)` for the BEFORE measurement but `smoke_train()` never called the paired `FastLanguageModel.for_training(model)` before `trainer.train()`. If that missing call meant the LoRA pass applied no real gradient pressure, every candidate would report retention ≈ 1.0 — indistinguishable from "held its shape perfectly" while actually meaning "nothing was measured". Fixed by adding the `for_training()` call AND a falsifiable check: `smoke_train` now returns `(model, loss_start, loss_end)` read from `trainer.state.log_history`, and `training_effective()` (a pure, unit-tested helper) reports whether loss actually decreased. `main()` prints a loud warning when it didn't.
+2. **IMPORTANT — train/eval chat-formatting mismatch, an uncontrolled cross-candidate confound.** The smoke sample hardcoded the literal string `<|user|>...<|assistant|>`, but `score()` evaluates via `tok.apply_chat_template(...)`. Different candidates use different real chat tokens (Gemma's `<start_of_turn>`, Qwen's `<|im_start|>`, etc.), so the literal string only coincidentally resembled a real chat turn for some of the field being ranked. Fixed by building the smoke samples with `tok.apply_chat_template(..., tokenize=False)` using the same tokenizer `score()` uses.
+3. **IMPORTANT — one repeated example is memorization, not style transfer.** The dataset was `[{"text": <one fixed string>}] * (steps * 2)` — every gradient step trained on the identical string (literal memorization), and with `per_device_train_batch_size=1` / `max_steps=steps` the `* 2` multiplier was dead weight since only the first `steps` rows were ever consumed. Fixed with `SMOKE_SAMPLES`, six genuinely distinct short HTML/CSS demos (canvas animation, CSS grid, SVG, transition, flex layout, gradient), cycled to fill `max(steps, len(SMOKE_SAMPLES))` rows (explicit, commented margin — no vestigial multiplier).
+4. **IMPORTANT — digit-dense smoke corpus could poison the scorer.** `is_correct`'s "last number in the text wins" heuristic risked grabbing a memorized corpus digit (200, 150, 20, 7, 300 from the old bouncing-ball canvas maths) instead of the model's actual GSM8K conclusion. Fixed two ways: (a) `SMOKE_SAMPLES` are kept digit-light — CSS keywords, named colours, short markup, no long numeric sequences — without contorting the HTML; (b) `score()` now also returns an `unparseable` count (`extract_answer` returned `None`), recorded as `unparseable_before` / `unparseable_after` in the result JSON so a jump between them (the signature of corpus bleed) is visible to Task 9 instead of silently corrupting `accuracy_after`.
+
+`write_result`'s signature changed accordingly (keyword args recommended): `write_result(model, n, before, after, loss_start, loss_end, unparseable_before, unparseable_after, out_dir) -> Path`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1687,7 +1696,7 @@ Create `finetune/tests/test_reasoning_probe.py`:
 
 ```python
 import json
-from finetune.bakeoff.reasoning_probe import retention, write_result
+from finetune.bakeoff.reasoning_probe import retention, write_result, training_effective
 
 
 def test_retention_is_ratio():
@@ -1706,14 +1715,55 @@ def test_retention_guards_divide_by_zero():
     assert retention(0.0, 0.0) == 1.0
 
 
+def test_retention_guards_asymmetric_zero():
+    # before == 0 but after > 0 must still hit the guard, not divide.
+    assert retention(0.0, 0.5) == 1.0
+
+
 def test_write_result_roundtrips(tmp_path):
-    path = write_result("unsloth/gemma-4-12b-it", 100, 0.80, 0.72, tmp_path)
+    path = write_result(
+        model="unsloth/gemma-4-12b-it",
+        n=100,
+        before=0.80,
+        after=0.72,
+        loss_start=1.9,
+        loss_end=1.2,
+        unparseable_before=1,
+        unparseable_after=4,
+        out_dir=tmp_path,
+    )
     data = json.loads(path.read_text())
     assert data["probe"] == "reasoning"
+    assert data["model"] == "unsloth/gemma-4-12b-it"
+    assert data["n"] == 100
     assert data["accuracy_before"] == 0.80
     assert data["accuracy_after"] == 0.72
     assert data["retention"] == 0.9
-    assert data["n"] == 100
+    assert data["loss_start"] == 1.9
+    assert data["loss_end"] == 1.2
+    assert data["training_effective"] is True
+    assert data["unparseable_before"] == 1
+    assert data["unparseable_after"] == 4
+
+
+def test_training_effective_true_when_loss_decreased():
+    assert training_effective(1.9, 1.2) is True
+
+
+def test_training_effective_false_when_loss_increased():
+    assert training_effective(1.0, 1.5) is False
+
+
+def test_training_effective_false_when_loss_unchanged():
+    assert training_effective(1.2, 1.2) is False
+
+
+def test_training_effective_false_when_loss_start_missing():
+    assert training_effective(None, 1.2) is False
+
+
+def test_training_effective_false_when_loss_end_missing():
+    assert training_effective(1.2, None) is False
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1722,141 +1772,11 @@ def test_write_result_roundtrips(tmp_path):
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_reasoning_probe.py -v
 ```
 
-Expected: FAIL — `ModuleNotFoundError: No module named 'finetune.bakeoff.reasoning_probe'`
+Expected: FAIL — `ImportError: cannot import name 'training_effective' from 'finetune.bakeoff.reasoning_probe'` (or `ModuleNotFoundError` on a from-scratch checkout).
 
 - [ ] **Step 3: Write implementation**
 
-Create `finetune/bakeoff/reasoning_probe.py`:
-
-```python
-"""Probe 0B: how much reasoning survives a short style fine-tune?
-
-Scores GSM8K before tuning, runs a deliberately small throwaway LoRA on
-HTML-ish text, scores again. The output is a RETENTION RATIO, not an
-accuracy — we are comparing degradation rates across candidate bases.
-
-The smoke corpus is intentionally tiny and synthetic. It exists to apply
-gradient pressure in the same shape the real corpus will, not to teach
-anything useful.
-"""
-import argparse
-import json
-from pathlib import Path
-
-from finetune.bakeoff.score import is_correct
-from finetune.bakeoff.vram_probe import slugify
-
-DEFAULT_OUT = Path(__file__).parent / "results"
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
-                  "gate_proj", "up_proj", "down_proj"]
-
-
-def retention(before: float, after: float) -> float:
-    if before == 0:
-        return 1.0
-    return round(after / before, 3)
-
-
-def write_result(model: str, n: int, before: float, after: float, out_dir: Path) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"reasoning_{slugify(model)}.json"
-    path.write_text(json.dumps({
-        "model": model,
-        "probe": "reasoning",
-        "n": n,
-        "accuracy_before": before,
-        "accuracy_after": after,
-        "retention": retention(before, after),
-    }, indent=2) + "\n")
-    return path
-
-
-def load_gsm8k(n: int):
-    from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split=f"test[:{n}]")
-    return [(r["question"], r["answer"]) for r in ds]
-
-
-def score(model, tok, rows, max_new_tokens: int = 256) -> float:
-    from unsloth import FastLanguageModel
-    FastLanguageModel.for_inference(model)
-    correct = 0
-    for question, gold in rows:
-        ids = tok.apply_chat_template(
-            [{"role": "user", "content": question}],
-            add_generation_prompt=True, return_tensors="pt", tokenize=True,
-        ).to("cuda")
-        gen = model.generate(input_ids=ids, max_new_tokens=max_new_tokens,
-                             do_sample=False)
-        text = tok.decode(gen[0][ids.shape[-1]:], skip_special_tokens=True)
-        correct += int(is_correct(text, gold))
-    return round(correct / len(rows), 3)
-
-
-def smoke_train(model, tok, steps: int, max_seqlen: int):
-    """Apply gradient pressure in the shape the real corpus will."""
-    from unsloth import FastLanguageModel
-    from datasets import Dataset
-    from trl import SFTTrainer, SFTConfig
-
-    model = FastLanguageModel.get_peft_model(
-        model, r=16, target_modules=TARGET_MODULES, lora_alpha=16,
-        use_gradient_checkpointing="unsloth",
-    )
-    samples = [{"text":
-        "<|user|>Make a demo with a bouncing ball.<|assistant|>"
-        "<!DOCTYPE html><html><head><style>body{margin:0;background:#111}"
-        "canvas{display:block}</style></head><body><canvas id=c></canvas>"
-        "<script>const x=document.getElementById('c').getContext('2d');"
-        "let y=0,v=2;function f(){y+=v;if(y>200||y<0)v*=-1;"
-        "x.clearRect(0,0,300,300);x.beginPath();x.arc(150,y,20,0,7);"
-        "x.fill();requestAnimationFrame(f)}f();</script></body></html>"
-    }] * (steps * 2)
-
-    trainer = SFTTrainer(
-        model=model, tokenizer=tok, train_dataset=Dataset.from_list(samples),
-        args=SFTConfig(max_steps=steps, per_device_train_batch_size=1,
-                       gradient_accumulation_steps=1, learning_rate=2e-4,
-                       max_seq_length=max_seqlen, logging_steps=5,
-                       output_dir="/tmp/bakeoff_smoke", report_to="none"),
-    )
-    trainer.train()
-    return model
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--n", type=int, default=100, help="GSM8K test rows")
-    ap.add_argument("--steps", type=int, default=60, help="smoke LoRA steps")
-    ap.add_argument("--max-seqlen", type=int, default=2048)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    args = ap.parse_args()
-
-    from unsloth import FastLanguageModel
-
-    rows = load_gsm8k(args.n)
-    model, tok = FastLanguageModel.from_pretrained(
-        model_name=args.model, max_seq_length=args.max_seqlen,
-        load_in_4bit=True, dtype=None,
-    )
-
-    before = score(model, tok, rows)
-    print(f"accuracy BEFORE tuning: {before}")
-
-    model = smoke_train(model, tok, args.steps, args.max_seqlen)
-
-    after = score(model, tok, rows)
-    print(f"accuracy AFTER  tuning: {after}")
-
-    path = write_result(args.model, args.n, before, after, args.out)
-    print(f"retention={retention(before, after)} -> {path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
+See `finetune/bakeoff/reasoning_probe.py` in the repo for the current implementation (kept out of this doc verbatim to avoid drift — the file is the source of truth). Summary of the shape: `SMOKE_SAMPLES` (six distinct digit-light HTML/CSS demos) → `smoke_train()` calls `FastLanguageModel.for_training(model)`, formats samples via `tok.apply_chat_template(..., tokenize=False)`, cycles them to `max(steps, len(SMOKE_SAMPLES))` rows, and returns `(model, loss_start, loss_end)` from `trainer.state.log_history` → `score()` returns `(accuracy, unparseable_count)` → `main()` computes `training_effective()`, warns loudly if it's `False`, warns if `unparseable_after > unparseable_before`, and calls `write_result(...)` with all ten fields.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1864,13 +1784,13 @@ if __name__ == "__main__":
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_reasoning_probe.py -v
 ```
 
-Expected: 5 tests PASS.
+Expected: 11 tests PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add finetune/bakeoff/reasoning_probe.py finetune/tests/test_reasoning_probe.py
-git commit -m "feat: add reasoning retention probe with smoke LoRA"
+git add finetune/bakeoff/reasoning_probe.py finetune/tests/test_reasoning_probe.py docs/superpowers/plans/2026-07-21-finetune-phase0-bakeoff.md
+git commit -m "fix: close training-effectiveness, chat-format, memorization, and corpus-bleed gaps in reasoning probe"
 ```
 
 ---
