@@ -384,6 +384,7 @@ Run with the GPU otherwise idle — a probe that OOMs because Ollama held VRAM
 is a wasted measurement.
 """
 import argparse
+import gc
 import json
 import re
 from pathlib import Path
@@ -421,7 +422,7 @@ def make_fits(model: str, rank: int = 16):
     from unsloth import FastLanguageModel
 
     def fits(seqlen: int) -> bool:
-        m = tok = None
+        m = tok = out = ids = None
         try:
             m, tok = FastLanguageModel.from_pretrained(
                 model_name=model,
@@ -451,7 +452,8 @@ def make_fits(model: str, rank: int = 16):
             print(f"  seqlen={seqlen}: OOM (RuntimeError)")
             return False
         finally:
-            del m, tok
+            del m, tok, out, ids
+            gc.collect()
             torch.cuda.empty_cache()
 
     return fits
