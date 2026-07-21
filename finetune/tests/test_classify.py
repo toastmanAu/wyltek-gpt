@@ -238,3 +238,60 @@ def test_truncated_base64_data_uri_is_none_and_does_not_raise():
     # not "native" -- an incomplete payload is not a genuine tool call.
     text = '{"image": "data:image/png;base64,' + "A" * 100_000
     assert classify_response(text) == "none"
+
+
+def test_tool_call_tag_repetition_is_fast_and_none():
+    # Round 4 finding: `_TOOL_CALL_TAG`'s regex
+    # `<tool_call>\s*(\{.*?\})\s*</tool_call>` with re.DOTALL has its own
+    # O(n^2) blowup, entirely independent of the bare-JSON scan hardened in
+    # rounds 1-3 (that scan never runs here -- `classify_response` calls the
+    # tag scan FIRST, unconditionally). When a `{` follows `<tool_call>` but
+    # no `}` ever appears, the non-greedy `.*?` must scan to end-of-string
+    # trying to complete the match, and it does this at every one of the n
+    # `<tool_call>` occurrences in an input like `'<tool_call>{' * n`.
+    # Measured on the pre-round-4 regex-based code with this exact repro:
+    # n=2000/23KB->0.099s, 4000/47KB->0.401s, 8000/94KB->1.596s,
+    # 16000/188KB->6.349s (~4x time per 2x size = quadratic). Control:
+    # `'<tool_call>' * 8000` with NO `{` runs in 0.0004s -- confirms the `{`
+    # (not the tag repetition itself) triggers the scan-to-end-of-string.
+    #
+    # Bound: 1.0s has enormous headroom over the low milliseconds a linear
+    # str.find-based scan should take, while sitting more than 6x below the
+    # pre-fix quadratic time at this size (6.349s) -- not flaky, but still
+    # catches a regression back to O(n^2).
+    text = "<tool_call>{" * 16000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 1.0
+
+
+def test_second_of_multiple_tool_call_pairs_is_native():
+    # Guards the find-based open/close tag pairing's advance logic: after
+    # the FIRST `<tool_call>...</tool_call>` pair is consumed (it parses as
+    # JSON but lacks "name"/"arguments", so it isn't a tool call), the scan
+    # must continue searching from just past that pair's closing tag and
+    # find the second, genuinely valid pair -- not stop at the first pair,
+    # and not re-scan from the document start.
+    text = (
+        '<tool_call>{"not": "a tool call"}</tool_call>\n'
+        '<tool_call>{"name":"preview_demo","arguments":{"html":"<p>hi</p>"}}</tool_call>'
+    )
+    assert classify_response(text) == "native"
+
+
+def test_unterminated_tool_call_tag_then_bare_json_call_is_native():
+    # Guards against the find-based pairing loop consuming the rest of the
+    # document on an unmatched open tag. `<tool_call>` here is never closed
+    # anywhere in the text (no `</tool_call>` at all), so
+    # `_iter_tool_call_payloads` must yield nothing and get out of the way --
+    # the classifier still has to fall through to the bare-JSON scan and
+    # find the genuine tool call written later in the same response.
+    text = (
+        "<tool_call>{oops, I forgot to close this tag\n"
+        'Anyway, {"name": "preview_demo", "arguments": {"html": "<p>hi</p>"}}'
+    )
+    assert classify_response(text) == "native"

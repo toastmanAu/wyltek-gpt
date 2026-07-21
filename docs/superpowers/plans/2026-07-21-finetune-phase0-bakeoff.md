@@ -754,6 +754,63 @@ def test_truncated_base64_data_uri_is_none_and_does_not_raise():
     # not "native" -- an incomplete payload is not a genuine tool call.
     text = '{"image": "data:image/png;base64,' + "A" * 100_000
     assert classify_response(text) == "none"
+
+
+def test_tool_call_tag_repetition_is_fast_and_none():
+    # Round 4 finding: `_TOOL_CALL_TAG`'s regex
+    # `<tool_call>\s*(\{.*?\})\s*</tool_call>` with re.DOTALL has its own
+    # O(n^2) blowup, entirely independent of the bare-JSON scan hardened in
+    # rounds 1-3 (that scan never runs here -- `classify_response` calls the
+    # tag scan FIRST, unconditionally). When a `{` follows `<tool_call>` but
+    # no `}` ever appears, the non-greedy `.*?` must scan to end-of-string
+    # trying to complete the match, and it does this at every one of the n
+    # `<tool_call>` occurrences in an input like `'<tool_call>{' * n`.
+    # Measured on the pre-round-4 regex-based code with this exact repro:
+    # n=2000/23KB->0.099s, 4000/47KB->0.401s, 8000/94KB->1.596s,
+    # 16000/188KB->6.349s (~4x time per 2x size = quadratic). Control:
+    # `'<tool_call>' * 8000` with NO `{` runs in 0.0004s -- confirms the `{`
+    # (not the tag repetition itself) triggers the scan-to-end-of-string.
+    #
+    # Bound: 1.0s has enormous headroom over the low milliseconds a linear
+    # str.find-based scan should take, while sitting more than 6x below the
+    # pre-fix quadratic time at this size (6.349s) -- not flaky, but still
+    # catches a regression back to O(n^2).
+    text = "<tool_call>{" * 16000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 1.0
+
+
+def test_second_of_multiple_tool_call_pairs_is_native():
+    # Guards the find-based open/close tag pairing's advance logic: after
+    # the FIRST `<tool_call>...</tool_call>` pair is consumed (it parses as
+    # JSON but lacks "name"/"arguments", so it isn't a tool call), the scan
+    # must continue searching from just past that pair's closing tag and
+    # find the second, genuinely valid pair -- not stop at the first pair,
+    # and not re-scan from the document start.
+    text = (
+        '<tool_call>{"not": "a tool call"}</tool_call>\n'
+        '<tool_call>{"name":"preview_demo","arguments":{"html":"<p>hi</p>"}}</tool_call>'
+    )
+    assert classify_response(text) == "native"
+
+
+def test_unterminated_tool_call_tag_then_bare_json_call_is_native():
+    # Guards against the find-based pairing loop consuming the rest of the
+    # document on an unmatched open tag. `<tool_call>` here is never closed
+    # anywhere in the text (no `</tool_call>` at all), so
+    # `_iter_tool_call_payloads` must yield nothing and get out of the way --
+    # the classifier still has to fall through to the bare-JSON scan and
+    # find the genuine tool call written later in the same response.
+    text = (
+        "<tool_call>{oops, I forgot to close this tag\n"
+        'Anyway, {"name": "preview_demo", "arguments": {"html": "<p>hi</p>"}}'
+    )
+    assert classify_response(text) == "native"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -790,7 +847,8 @@ the whole run.
 import json
 import re
 
-_TOOL_CALL_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_OPEN_TAG = "<tool_call>"
+_CLOSE_TAG = "</tool_call>"
 _OP_FENCED = re.compile(r"```op:[A-Za-z_][A-Za-z0-9_]*\s*\n")
 _OP_UNFENCED = re.compile(r"^\s*op:([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
 
@@ -801,6 +859,57 @@ NONE = "none"
 
 def _is_tool_call_payload(obj: object) -> bool:
     return isinstance(obj, dict) and "name" in obj and "arguments" in obj
+
+
+def _iter_tool_call_payloads(text: str):
+    """Yield the raw text between each ``<tool_call>``/``</tool_call>`` pair.
+
+    Round 4 finding: this used to be a regex --
+    ``r"<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>"`` with ``re.DOTALL`` -- with
+    its OWN O(n^2) blowup, entirely independent of the bare-JSON scan
+    hardened in rounds 1-3. `classify_response` runs this scan FIRST,
+    unconditionally, before the bare-JSON scan ever gets a chance to run.
+    When a `{` follows `<tool_call>` but no `}` (or no closing tag at all)
+    exists anywhere later in the text, the non-greedy `.*?` must scan
+    forward to end-of-string trying to complete the match, and it repeats
+    that scan-to-end at EVERY one of the n `<tool_call>` occurrences in an
+    input like `'<tool_call>{' * n` -- O(n) wasted work at each of O(n)
+    start positions, i.e. O(n^2) overall. Measured: n=16000 (188KB) took
+    6.349s; a control input with the same number of tags but no `{` (so the
+    non-greedy scan never has anything to chase) ran in 0.0004s, confirming
+    the `{` is what triggers it, not the tag repetition by itself.
+
+    The fix removes the possibility structurally rather than patching this
+    instance: `str.find` performs a linear-time, non-backtracking substring
+    search with no notion of "try to extend the match, fail, try a longer
+    extension" -- there is nothing here that can rescan the same span of
+    text a second time chasing a match that doesn't exist. `pos` only ever
+    advances forward (never resets backward) between iterations, so the
+    `text.find` calls across the whole generator collectively perform a
+    small constant number of linear passes over `text` -- O(n) total, for
+    any input whatsoever, including the adversarial repetition above.
+
+    Pairing is nearest-open-to-nearest-close, matching the original regex's
+    behavior for non-overlapping, non-nested tags (both find the closest
+    valid closing point rather than the outermost or farthest one). If an
+    open tag has no closing tag anywhere later in `text`, the generator
+    stops rather than continuing to search past it -- correct because nothing
+    after an unmatched open tag can retroactively close it, and this is
+    exactly what keeps an unterminated `<tool_call>` from making the scan
+    consume (or misattribute) the remainder of the document.
+    """
+    pos = 0
+    n = len(text)
+    while pos <= n:
+        start = text.find(_OPEN_TAG, pos)
+        if start == -1:
+            return
+        content_start = start + len(_OPEN_TAG)
+        end = text.find(_CLOSE_TAG, content_start)
+        if end == -1:
+            return
+        yield text[content_start:end]
+        pos = end + len(_CLOSE_TAG)
 
 
 def _payload_from_string(raw: str) -> bool:
@@ -876,31 +985,45 @@ def _has_bare_json_tool_call(text: str) -> bool:
       trailing-comma JS object literal repeated across a large document.
 
       The fix: a real tool call payload is a dict with both a "name" key
-      and an "arguments" key (`_is_tool_call_payload`), and in every case
-      this module has to detect, those keys are written literally as the
-      substrings ``"name"`` and ``"arguments"`` in the source text (JSON
-      does not require escaping ordinary ASCII letters, and nothing this
-      probe measures does so). That means a genuine tool call's own
-      substring necessarily contains both literal substrings somewhere at
-      or after its opening `{`. So: if the literal substring ``"name"``
-      does not occur anywhere in `text` at or after `idx`, no object
-      starting at `idx` can be a tool call payload, and `raw_decode` is
-      skipped — same for ``"arguments"``. The last occurrence of each
-      substring in the whole text (`str.rfind`, computed once, O(n)) is
-      enough for the "at or after idx" check: `idx <= last_occurrence` is
-      a valid over-approximation (it may still attempt a decode that
-      turns out to fail, but it can never skip a position that could
-      genuinely succeed, since a genuine tool call's key literally lives
-      at some position >= idx, so the LAST such position is also >= idx).
+      and an "arguments" key (`_is_tool_call_payload`). This pre-filter
+      ASSUMES those keys are written literally as the substrings ``"name"``
+      and ``"arguments"`` in the source text — true whenever a model emits
+      ordinary ASCII key names un-escaped, which is how every model this
+      probe has observed writes JSON, but NOT a property JSON's grammar
+      guarantees. A key can legally be written with a `\\u` escape (e.g.
+      ``"na\\u006de"`` decodes to ``"name"``), in which case the literal
+      substring ``"name"`` never appears in the source text at all, and
+      this pre-filter will skip `raw_decode` at that position — even though
+      the object genuinely would decode to a valid tool call payload.
 
-      This is sound but not a complete defense against every conceivable
-      adversarial input: a document that densely repeats BOTH literal
-      substrings ``"name"`` and ``"arguments"`` alongside many
-      invalid-JSON-shaped braces could still accumulate failed-decode
-      cost. That shape does not match any of the round-3 finding's
-      reproducers (trailing comma, single-quoted key, truncated
-      data-URI) or this probe's real input distribution (model-generated
-      HTML/CSS/JS demos), so it's out of scope here.
+      KNOWN ACCEPTED LIMITATION, not a bug to fix here: such an object is
+      scored "none" instead of "native" — a false negative that slightly
+      understates a candidate's native-tool-call rate. Real-world impact is
+      judged LOW (local LLMs essentially never `\\u`-escape ASCII key
+      names), and contorting this scan to also decode escaped keys before
+      knowing whether a `{` is even JSON-shaped is not worth the
+      complexity for a shape that hasn't been observed in practice.
+
+      Given that assumption holds, if the literal substring ``"name"``
+      does not occur anywhere in `text` at or after `idx`, no object
+      starting at `idx` can be a tool call payload (under the assumption),
+      and `raw_decode` is skipped — same for ``"arguments"``. The last
+      occurrence of each substring in the whole text (`str.rfind`,
+      computed once, O(n)) is enough for the "at or after idx" check:
+      `idx <= last_occurrence` is a valid over-approximation (it may still
+      attempt a decode that turns out to fail, but it can never skip a
+      position that could genuinely succeed under the assumption, since
+      such a key literally lives at some position >= idx, so the LAST such
+      position is also >= idx).
+
+      This is sound (given the assumption) but not a complete defense
+      against every conceivable adversarial input: a document that
+      densely repeats BOTH literal substrings ``"name"`` and
+      ``"arguments"`` alongside many invalid-JSON-shaped braces could
+      still accumulate failed-decode cost. That shape does not match any
+      of the round-3 finding's reproducers (trailing comma, single-quoted
+      key, truncated data-URI) or this probe's real input distribution
+      (model-generated HTML/CSS/JS demos), so it's out of scope here.
     """
     last_name_pos = text.rfind('"name"')
     if last_name_pos == -1:
@@ -937,12 +1060,8 @@ def classify_response(text: str) -> str:
     if not text:
         return NONE
 
-    try:
-        tag_matches = _TOOL_CALL_TAG.findall(text)
-    except RecursionError:
-        tag_matches = []
-    for match in tag_matches:
-        if _payload_from_string(match):
+    for candidate in _iter_tool_call_payloads(text):
+        if _payload_from_string(candidate):
             return NATIVE
 
     if _has_bare_json_tool_call(text):
@@ -972,6 +1091,41 @@ Expected: 20 tests PASS.
 git add finetune/bakeoff/classify.py finetune/tests/test_classify.py
 git commit -m "feat: add native-vs-fallback tool call classifier"
 ```
+
+**Round 4 hardening (post-launch, eliminates a bug CLASS):** `_TOOL_CALL_TAG`'s
+regex (`<tool_call>\s*(\{.*?\})\s*</tool_call>` with `re.DOTALL`) had its own
+O(n^2) blowup, independent of `_has_bare_json_tool_call`'s rounds-1-3 fixes,
+and it ran FIRST and unconditionally on every call to `classify_response`. An
+input like `'<tool_call>{' * n` (no closing tag or `}` anywhere) forces the
+non-greedy `.*?` to scan to end-of-string at every one of the n tag
+occurrences — measured 6.349s at n=16000/188KB, ~4x time per 2x size
+(quadratic). The fix replaces the regex with `_iter_tool_call_payloads`, a
+generator built on `str.find`-based open/close tag pairing: `pos` only
+advances forward, `str.find` is linear/non-backtracking, so the whole scan is
+O(n) for any input. `classify_response` now iterates this generator directly
+instead of calling `_TOOL_CALL_TAG.findall`. The code block above (and the
+test file above it) reflect this fixed, current state of both files —
+`finetune/bakeoff/classify.py` and `finetune/tests/test_classify.py` — not
+the original round-1 launch state. Three new tests were added (bringing the
+suite to **23 tests**, up from 20):
+`test_tool_call_tag_repetition_is_fast_and_none` (n=16000 repro completes in
+well under 1.0s, down from the pre-fix 6.349s),
+`test_second_of_multiple_tool_call_pairs_is_native` (guards the pairing
+loop's forward-advance logic), and
+`test_unterminated_tool_call_tag_then_bare_json_call_is_native` (guards
+against an unmatched open tag causing the pairing loop to consume, or
+misattribute, the rest of the document). `_OP_FENCED` and `_OP_UNFENCED` were
+also audited for the same class of bug (adversarial inputs targeting their
+`\s*`/`[A-Za-z0-9_]*` quantifiers) and confirmed linear both structurally (no
+nested/overlapping quantifiers — the classic backtracking trigger — are
+present) and empirically (time roughly doubles as n doubles, no quadratic
+growth), so neither needed conversion to `str.find`.
+
+```bash
+cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_classify.py -v
+```
+
+Expected: 23 tests PASS.
 
 ---
 

@@ -19,7 +19,8 @@ the whole run.
 import json
 import re
 
-_TOOL_CALL_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_OPEN_TAG = "<tool_call>"
+_CLOSE_TAG = "</tool_call>"
 _OP_FENCED = re.compile(r"```op:[A-Za-z_][A-Za-z0-9_]*\s*\n")
 _OP_UNFENCED = re.compile(r"^\s*op:([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
 
@@ -30,6 +31,57 @@ NONE = "none"
 
 def _is_tool_call_payload(obj: object) -> bool:
     return isinstance(obj, dict) and "name" in obj and "arguments" in obj
+
+
+def _iter_tool_call_payloads(text: str):
+    """Yield the raw text between each ``<tool_call>``/``</tool_call>`` pair.
+
+    Round 4 finding: this used to be a regex --
+    ``r"<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>"`` with ``re.DOTALL`` -- with
+    its OWN O(n^2) blowup, entirely independent of the bare-JSON scan
+    hardened in rounds 1-3. `classify_response` runs this scan FIRST,
+    unconditionally, before the bare-JSON scan ever gets a chance to run.
+    When a `{` follows `<tool_call>` but no `}` (or no closing tag at all)
+    exists anywhere later in the text, the non-greedy `.*?` must scan
+    forward to end-of-string trying to complete the match, and it repeats
+    that scan-to-end at EVERY one of the n `<tool_call>` occurrences in an
+    input like `'<tool_call>{' * n` -- O(n) wasted work at each of O(n)
+    start positions, i.e. O(n^2) overall. Measured: n=16000 (188KB) took
+    6.349s; a control input with the same number of tags but no `{` (so the
+    non-greedy scan never has anything to chase) ran in 0.0004s, confirming
+    the `{` is what triggers it, not the tag repetition by itself.
+
+    The fix removes the possibility structurally rather than patching this
+    instance: `str.find` performs a linear-time, non-backtracking substring
+    search with no notion of "try to extend the match, fail, try a longer
+    extension" -- there is nothing here that can rescan the same span of
+    text a second time chasing a match that doesn't exist. `pos` only ever
+    advances forward (never resets backward) between iterations, so the
+    `text.find` calls across the whole generator collectively perform a
+    small constant number of linear passes over `text` -- O(n) total, for
+    any input whatsoever, including the adversarial repetition above.
+
+    Pairing is nearest-open-to-nearest-close, matching the original regex's
+    behavior for non-overlapping, non-nested tags (both find the closest
+    valid closing point rather than the outermost or farthest one). If an
+    open tag has no closing tag anywhere later in `text`, the generator
+    stops rather than continuing to search past it -- correct because nothing
+    after an unmatched open tag can retroactively close it, and this is
+    exactly what keeps an unterminated `<tool_call>` from making the scan
+    consume (or misattribute) the remainder of the document.
+    """
+    pos = 0
+    n = len(text)
+    while pos <= n:
+        start = text.find(_OPEN_TAG, pos)
+        if start == -1:
+            return
+        content_start = start + len(_OPEN_TAG)
+        end = text.find(_CLOSE_TAG, content_start)
+        if end == -1:
+            return
+        yield text[content_start:end]
+        pos = end + len(_CLOSE_TAG)
 
 
 def _payload_from_string(raw: str) -> bool:
@@ -105,31 +157,45 @@ def _has_bare_json_tool_call(text: str) -> bool:
       trailing-comma JS object literal repeated across a large document.
 
       The fix: a real tool call payload is a dict with both a "name" key
-      and an "arguments" key (`_is_tool_call_payload`), and in every case
-      this module has to detect, those keys are written literally as the
-      substrings ``"name"`` and ``"arguments"`` in the source text (JSON
-      does not require escaping ordinary ASCII letters, and nothing this
-      probe measures does so). That means a genuine tool call's own
-      substring necessarily contains both literal substrings somewhere at
-      or after its opening `{`. So: if the literal substring ``"name"``
-      does not occur anywhere in `text` at or after `idx`, no object
-      starting at `idx` can be a tool call payload, and `raw_decode` is
-      skipped — same for ``"arguments"``. The last occurrence of each
-      substring in the whole text (`str.rfind`, computed once, O(n)) is
-      enough for the "at or after idx" check: `idx <= last_occurrence` is
-      a valid over-approximation (it may still attempt a decode that
-      turns out to fail, but it can never skip a position that could
-      genuinely succeed, since a genuine tool call's key literally lives
-      at some position >= idx, so the LAST such position is also >= idx).
+      and an "arguments" key (`_is_tool_call_payload`). This pre-filter
+      ASSUMES those keys are written literally as the substrings ``"name"``
+      and ``"arguments"`` in the source text — true whenever a model emits
+      ordinary ASCII key names un-escaped, which is how every model this
+      probe has observed writes JSON, but NOT a property JSON's grammar
+      guarantees. A key can legally be written with a `\\u` escape (e.g.
+      ``"na\\u006de"`` decodes to ``"name"``), in which case the literal
+      substring ``"name"`` never appears in the source text at all, and
+      this pre-filter will skip `raw_decode` at that position — even though
+      the object genuinely would decode to a valid tool call payload.
 
-      This is sound but not a complete defense against every conceivable
-      adversarial input: a document that densely repeats BOTH literal
-      substrings ``"name"`` and ``"arguments"`` alongside many
-      invalid-JSON-shaped braces could still accumulate failed-decode
-      cost. That shape does not match any of the round-3 finding's
-      reproducers (trailing comma, single-quoted key, truncated
-      data-URI) or this probe's real input distribution (model-generated
-      HTML/CSS/JS demos), so it's out of scope here.
+      KNOWN ACCEPTED LIMITATION, not a bug to fix here: such an object is
+      scored "none" instead of "native" — a false negative that slightly
+      understates a candidate's native-tool-call rate. Real-world impact is
+      judged LOW (local LLMs essentially never `\\u`-escape ASCII key
+      names), and contorting this scan to also decode escaped keys before
+      knowing whether a `{` is even JSON-shaped is not worth the
+      complexity for a shape that hasn't been observed in practice.
+
+      Given that assumption holds, if the literal substring ``"name"``
+      does not occur anywhere in `text` at or after `idx`, no object
+      starting at `idx` can be a tool call payload (under the assumption),
+      and `raw_decode` is skipped — same for ``"arguments"``. The last
+      occurrence of each substring in the whole text (`str.rfind`,
+      computed once, O(n)) is enough for the "at or after idx" check:
+      `idx <= last_occurrence` is a valid over-approximation (it may still
+      attempt a decode that turns out to fail, but it can never skip a
+      position that could genuinely succeed under the assumption, since
+      such a key literally lives at some position >= idx, so the LAST such
+      position is also >= idx).
+
+      This is sound (given the assumption) but not a complete defense
+      against every conceivable adversarial input: a document that
+      densely repeats BOTH literal substrings ``"name"`` and
+      ``"arguments"`` alongside many invalid-JSON-shaped braces could
+      still accumulate failed-decode cost. That shape does not match any
+      of the round-3 finding's reproducers (trailing comma, single-quoted
+      key, truncated data-URI) or this probe's real input distribution
+      (model-generated HTML/CSS/JS demos), so it's out of scope here.
     """
     last_name_pos = text.rfind('"name"')
     if last_name_pos == -1:
@@ -166,12 +232,8 @@ def classify_response(text: str) -> str:
     if not text:
         return NONE
 
-    try:
-        tag_matches = _TOOL_CALL_TAG.findall(text)
-    except RecursionError:
-        tag_matches = []
-    for match in tag_matches:
-        if _payload_from_string(match):
+    for candidate in _iter_tool_call_payloads(text):
+        if _payload_from_string(candidate):
             return NATIVE
 
     if _has_bare_json_tool_call(text):
