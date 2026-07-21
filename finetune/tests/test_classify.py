@@ -182,3 +182,59 @@ def test_large_payload_with_real_tool_call_near_end_is_native():
     )
     assert len(text) > 500_000
     assert classify_response(text) == "native"
+
+
+def test_trailing_comma_objects_are_fast_and_none():
+    # Round 3 finding: `_looks_like_json_object_start` only screens by SHAPE
+    # (is the char after `{`+ws a quote or `}`?). A trailing-comma object
+    # like `{"a": 1, "b": 2,}` passes that shape check -- `"` follows `{` --
+    # but is not valid strict JSON, so every occurrence still falls through
+    # to `raw_decode`, which raises `JSONDecodeError`. That exception's
+    # `__init__` computes `doc.count("\n", 0, pos)`, an O(pos) scan of the
+    # WHOLE document, so summed over every occurrence in a large document
+    # this is O(n^2) again -- just moved from "fails the shape check" to
+    # "passes the shape check but fails to decode". Measured on the
+    # round-2 code with this exact repro: n=2000/127KB->0.039s,
+    # 4000/254KB->0.148s, 8000/508KB->0.579s, 16000/1016KB->2.206s (us/char
+    # roughly doubling each time n doubles = quadratic). None of these
+    # fragments contain the literal substrings `"name"` or `"arguments"`
+    # anywhere in the document, so a sound fix can skip `raw_decode`
+    # entirely here.
+    #
+    # Bound: 0.5s has enormous headroom over what a linear scan should take
+    # (low tens of milliseconds expected) while being over 4x below the
+    # round-2 code's observed 2.2s at this size -- not flaky, but still
+    # catches a regression back to quadratic behavior.
+    frag = '{"a": 1, "b": 2,}\n'
+    filler = "some prose text here padding out the document. "
+    text = (frag + filler) * 16000
+    assert len(text) > 1_000_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 0.5
+
+
+def test_reversed_key_order_bare_json_is_native():
+    # Soundness guard for a key-presence pre-filter: JSON objects are
+    # unordered, so `{"arguments": {...}, "name": "..."}` is exactly as
+    # valid a tool call as the more common `{"name": ..., "arguments": ...}`
+    # ordering. A pre-filter that assumed "name" must appear before
+    # "arguments" in the text would wrongly prune this position and turn a
+    # real tool call into "none".
+    text = '{"arguments": {"demo_id": "d1"}, "name": "save_demo"}'
+    assert classify_response(text) == "native"
+
+
+def test_truncated_base64_data_uri_is_none_and_does_not_raise():
+    # Another everyday shape named in the round-3 finding: a candidate that
+    # hits its output token limit mid-generation while emitting an embedded
+    # image leaves an unterminated JSON string. `{"image": "data:..."` has
+    # no closing quote or brace at all, so `raw_decode` must fail cleanly
+    # (not raise out of `classify_response`) and the result must be "none",
+    # not "native" -- an incomplete payload is not a genuine tool call.
+    text = '{"image": "data:image/png;base64,' + "A" * 100_000
+    assert classify_response(text) == "none"

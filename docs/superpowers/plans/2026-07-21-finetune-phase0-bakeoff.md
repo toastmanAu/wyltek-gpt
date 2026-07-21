@@ -698,6 +698,62 @@ def test_large_payload_with_real_tool_call_near_end_is_native():
     )
     assert len(text) > 500_000
     assert classify_response(text) == "native"
+
+
+def test_trailing_comma_objects_are_fast_and_none():
+    # Round 3 finding: `_looks_like_json_object_start` only screens by SHAPE
+    # (is the char after `{`+ws a quote or `}`?). A trailing-comma object
+    # like `{"a": 1, "b": 2,}` passes that shape check -- `"` follows `{` --
+    # but is not valid strict JSON, so every occurrence still falls through
+    # to `raw_decode`, which raises `JSONDecodeError`. That exception's
+    # `__init__` computes `doc.count("\n", 0, pos)`, an O(pos) scan of the
+    # WHOLE document, so summed over every occurrence in a large document
+    # this is O(n^2) again -- just moved from "fails the shape check" to
+    # "passes the shape check but fails to decode". Measured on the
+    # round-2 code with this exact repro: n=2000/127KB->0.039s,
+    # 4000/254KB->0.148s, 8000/508KB->0.579s, 16000/1016KB->2.206s (us/char
+    # roughly doubling each time n doubles = quadratic). None of these
+    # fragments contain the literal substrings `"name"` or `"arguments"`
+    # anywhere in the document, so a sound fix can skip `raw_decode`
+    # entirely here.
+    #
+    # Bound: 0.5s has enormous headroom over what a linear scan should take
+    # (low tens of milliseconds expected) while being over 4x below the
+    # round-2 code's observed 2.2s at this size -- not flaky, but still
+    # catches a regression back to quadratic behavior.
+    frag = '{"a": 1, "b": 2,}\n'
+    filler = "some prose text here padding out the document. "
+    text = (frag + filler) * 16000
+    assert len(text) > 1_000_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 0.5
+
+
+def test_reversed_key_order_bare_json_is_native():
+    # Soundness guard for a key-presence pre-filter: JSON objects are
+    # unordered, so `{"arguments": {...}, "name": "..."}` is exactly as
+    # valid a tool call as the more common `{"name": ..., "arguments": ...}`
+    # ordering. A pre-filter that assumed "name" must appear before
+    # "arguments" in the text would wrongly prune this position and turn a
+    # real tool call into "none".
+    text = '{"arguments": {"demo_id": "d1"}, "name": "save_demo"}'
+    assert classify_response(text) == "native"
+
+
+def test_truncated_base64_data_uri_is_none_and_does_not_raise():
+    # Another everyday shape named in the round-3 finding: a candidate that
+    # hits its output token limit mid-generation while emitting an embedded
+    # image leaves an unterminated JSON string. `{"image": "data:..."` has
+    # no closing quote or brace at all, so `raw_decode` must fail cleanly
+    # (not raise out of `classify_response`) and the result must be "none",
+    # not "native" -- an incomplete payload is not a genuine tool call.
+    text = '{"image": "data:image/png;base64,' + "A" * 100_000
+    assert classify_response(text) == "none"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -797,8 +853,8 @@ def _has_bare_json_tool_call(text: str) -> bool:
     ``json.JSONDecoder.raw_decode`` lets the real JSON grammar find each
     object's true extent instead of guessing with a regex.
 
-    Two things can make this scan blow up on adversarial or merely
-    brace-dense input, and both are handled here:
+    Three things can make this scan blow up on adversarial or merely
+    brace-dense input, and all three are handled here:
 
     - Deeply-nested JSON makes ``raw_decode`` raise ``RecursionError``, not
       ``ValueError`` (`RecursionError` is a `RuntimeError` subclass). Left
@@ -806,15 +862,58 @@ def _has_bare_json_tool_call(text: str) -> bool:
       Caught per-position (not at the top of `classify_response`), a
       RecursionError at one `{` still lets the scan continue and find a
       genuine tool call elsewhere in the same text.
-    - Brace-dense non-JSON text (this probe's normal case) makes most `{`
-      positions fail to parse; each failure used to construct a
-      `JSONDecodeError`, which is O(position-in-document), making the whole
-      scan O(n^2). `_looks_like_json_object_start` prunes those positions
-      before `raw_decode` is ever called.
+    - Brace-dense non-JSON text whose ``{`` is not even shaped like an
+      object opening (CSS rule blocks, JS control-flow blocks) is pruned by
+      `_looks_like_json_object_start` before `raw_decode` is ever called.
+    - Brace-dense text that DOES look like an object opening (``{"`` or
+      ``{}``) but fails to decode (trailing comma, single-quoted keys, an
+      unterminated string cut off mid-generation) still reaches
+      `raw_decode`, and a *failed* `raw_decode` constructs a
+      `json.JSONDecodeError`, whose line/column computation
+      (``doc.count("\\n", 0, pos)``) is O(position-in-document). Summed over
+      every such position that's just object-shaped-but-invalid, that's
+      O(n^2) again — this is the round-3 finding, reproduced by an ordinary
+      trailing-comma JS object literal repeated across a large document.
+
+      The fix: a real tool call payload is a dict with both a "name" key
+      and an "arguments" key (`_is_tool_call_payload`), and in every case
+      this module has to detect, those keys are written literally as the
+      substrings ``"name"`` and ``"arguments"`` in the source text (JSON
+      does not require escaping ordinary ASCII letters, and nothing this
+      probe measures does so). That means a genuine tool call's own
+      substring necessarily contains both literal substrings somewhere at
+      or after its opening `{`. So: if the literal substring ``"name"``
+      does not occur anywhere in `text` at or after `idx`, no object
+      starting at `idx` can be a tool call payload, and `raw_decode` is
+      skipped — same for ``"arguments"``. The last occurrence of each
+      substring in the whole text (`str.rfind`, computed once, O(n)) is
+      enough for the "at or after idx" check: `idx <= last_occurrence` is
+      a valid over-approximation (it may still attempt a decode that
+      turns out to fail, but it can never skip a position that could
+      genuinely succeed, since a genuine tool call's key literally lives
+      at some position >= idx, so the LAST such position is also >= idx).
+
+      This is sound but not a complete defense against every conceivable
+      adversarial input: a document that densely repeats BOTH literal
+      substrings ``"name"`` and ``"arguments"`` alongside many
+      invalid-JSON-shaped braces could still accumulate failed-decode
+      cost. That shape does not match any of the round-3 finding's
+      reproducers (trailing comma, single-quoted key, truncated
+      data-URI) or this probe's real input distribution (model-generated
+      HTML/CSS/JS demos), so it's out of scope here.
     """
+    last_name_pos = text.rfind('"name"')
+    if last_name_pos == -1:
+        return False
+    last_arguments_pos = text.rfind('"arguments"')
+    if last_arguments_pos == -1:
+        return False
+
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(text):
         if ch != "{" or not _looks_like_json_object_start(text, idx):
+            continue
+        if idx > last_name_pos or idx > last_arguments_pos:
             continue
         try:
             obj, _end = decoder.raw_decode(text, idx)
@@ -865,7 +964,7 @@ def classify_response(text: str) -> str:
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_classify.py -v
 ```
 
-Expected: 17 tests PASS.
+Expected: 20 tests PASS.
 
 - [ ] **Step 5: Commit**
 

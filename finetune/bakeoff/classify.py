@@ -82,8 +82,8 @@ def _has_bare_json_tool_call(text: str) -> bool:
     ``json.JSONDecoder.raw_decode`` lets the real JSON grammar find each
     object's true extent instead of guessing with a regex.
 
-    Two things can make this scan blow up on adversarial or merely
-    brace-dense input, and both are handled here:
+    Three things can make this scan blow up on adversarial or merely
+    brace-dense input, and all three are handled here:
 
     - Deeply-nested JSON makes ``raw_decode`` raise ``RecursionError``, not
       ``ValueError`` (`RecursionError` is a `RuntimeError` subclass). Left
@@ -91,15 +91,58 @@ def _has_bare_json_tool_call(text: str) -> bool:
       Caught per-position (not at the top of `classify_response`), a
       RecursionError at one `{` still lets the scan continue and find a
       genuine tool call elsewhere in the same text.
-    - Brace-dense non-JSON text (this probe's normal case) makes most `{`
-      positions fail to parse; each failure used to construct a
-      `JSONDecodeError`, which is O(position-in-document), making the whole
-      scan O(n^2). `_looks_like_json_object_start` prunes those positions
-      before `raw_decode` is ever called.
+    - Brace-dense non-JSON text whose ``{`` is not even shaped like an
+      object opening (CSS rule blocks, JS control-flow blocks) is pruned by
+      `_looks_like_json_object_start` before `raw_decode` is ever called.
+    - Brace-dense text that DOES look like an object opening (``{"`` or
+      ``{}``) but fails to decode (trailing comma, single-quoted keys, an
+      unterminated string cut off mid-generation) still reaches
+      `raw_decode`, and a *failed* `raw_decode` constructs a
+      `json.JSONDecodeError`, whose line/column computation
+      (``doc.count("\\n", 0, pos)``) is O(position-in-document). Summed over
+      every such position that's just object-shaped-but-invalid, that's
+      O(n^2) again — this is the round-3 finding, reproduced by an ordinary
+      trailing-comma JS object literal repeated across a large document.
+
+      The fix: a real tool call payload is a dict with both a "name" key
+      and an "arguments" key (`_is_tool_call_payload`), and in every case
+      this module has to detect, those keys are written literally as the
+      substrings ``"name"`` and ``"arguments"`` in the source text (JSON
+      does not require escaping ordinary ASCII letters, and nothing this
+      probe measures does so). That means a genuine tool call's own
+      substring necessarily contains both literal substrings somewhere at
+      or after its opening `{`. So: if the literal substring ``"name"``
+      does not occur anywhere in `text` at or after `idx`, no object
+      starting at `idx` can be a tool call payload, and `raw_decode` is
+      skipped — same for ``"arguments"``. The last occurrence of each
+      substring in the whole text (`str.rfind`, computed once, O(n)) is
+      enough for the "at or after idx" check: `idx <= last_occurrence` is
+      a valid over-approximation (it may still attempt a decode that
+      turns out to fail, but it can never skip a position that could
+      genuinely succeed, since a genuine tool call's key literally lives
+      at some position >= idx, so the LAST such position is also >= idx).
+
+      This is sound but not a complete defense against every conceivable
+      adversarial input: a document that densely repeats BOTH literal
+      substrings ``"name"`` and ``"arguments"`` alongside many
+      invalid-JSON-shaped braces could still accumulate failed-decode
+      cost. That shape does not match any of the round-3 finding's
+      reproducers (trailing comma, single-quoted key, truncated
+      data-URI) or this probe's real input distribution (model-generated
+      HTML/CSS/JS demos), so it's out of scope here.
     """
+    last_name_pos = text.rfind('"name"')
+    if last_name_pos == -1:
+        return False
+    last_arguments_pos = text.rfind('"arguments"')
+    if last_arguments_pos == -1:
+        return False
+
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(text):
         if ch != "{" or not _looks_like_json_object_start(text, idx):
+            continue
+        if idx > last_name_pos or idx > last_arguments_pos:
             continue
         try:
             obj, _end = decoder.raw_decode(text, idx)
