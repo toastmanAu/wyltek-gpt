@@ -1,0 +1,95 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "preview_demo",
+      "description": "Render a self-contained HTML demo headless and return diagnostics (load ok, JS console errors, exceptions, DOM/canvas sanity, whether requestAnimationFrame ran). Returns a demo_id \u2014 reuse it for patches. Send the FULL html here only once; use patch_demo to iterate.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "html": {
+            "type": "string",
+            "description": "full self-contained HTML document"
+          },
+          "name": {
+            "type": "string",
+            "description": "short label for the demo"
+          },
+          "demo_id": {
+            "type": "string",
+            "description": "reuse to replace an existing demo (rewrite fallback)"
+          },
+          "settle_ms": {
+            "type": "integer",
+            "description": "ms to wait after load before capture (default 700)"
+          }
+        },
+        "required": [
+          "html"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "patch_demo",
+      "description": "Apply small find/replace edits to a stored demo (by demo_id) and re-render. Each 'find' must match the stored HTML uniquely. On failure, re-send full html via preview_demo with the same demo_id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "demo_id": {
+            "type": "string",
+            "description": "handle from preview_demo"
+          },
+          "edits": {
+            "type": "array",
+            "description": "list of {find, replace} string edits",
+            "items": {
+              "type": "object",
+              "properties": {
+                "find": {
+                  "type": "string"
+                },
+                "replace": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "find",
+                "replace"
+              ]
+            }
+          }
+        },
+        "required": [
+          "demo_id",
+          "edits"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_demo",
+      "description": "Persist a finished demo (by demo_id) to disk and surface a preview card in the chat. Call this once the demo renders cleanly.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "demo_id": {
+            "type": "string",
+            "description": "handle to persist"
+          },
+          "name": {
+            "type": "string",
+            "description": "optional filename label override"
+          }
+        },
+        "required": [
+          "demo_id"
+        ]
+      }
+    }
+  }
+]
