@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Measure `unsloth/gemma-4-12b-it` against `unsloth/Qwen3.6-27B` on this machine across VRAM ceiling, reasoning retention under tuning, and native tool-call reliability — producing a defensible base-model choice before any corpus work begins.
+**Goal:** Measure `unsloth/gemma-4-12b-it` against `unsloth/gpt-oss-20b-unsloth-bnb-4bit` on this machine across VRAM ceiling, reasoning retention under tuning, and native tool-call reliability — producing a defensible base-model choice before any corpus work begins.
 
 **Architecture:** A `finetune/bakeoff/` package inside `local-chatbot`, living beside the spec and the `html_demo` skill it measures against. All GPU/model work sits behind injectable function parameters so the decision logic (binary search, response classification, answer scoring) is unit-testable on CPU with no model download. Three independent probes write JSON result files; a final reporter aggregates them into a comparison table.
 
@@ -13,7 +13,9 @@
 - **Two venvs, do not mix.** Bake-off code runs under `~/.unsloth/studio/unsloth_studio/bin/python` (3.13). The app runs under `~/local-chatbot/.venv/bin/python` (3.10). Cross-venv imports are forbidden — the schema bridge is a generated JSON file.
 - **Usable VRAM is ~21 GB, not 24 GB.** The desktop compositor holds ~3 GB (measured: `rocm-smi` reports 12% allocated at idle). All ceilings are measured against real free memory, not nameplate.
 - **GPU is exclusive-use during probes.** Stop `wan-worker`/ComfyUI/Ollama large models before running. A probe that OOMs because something else held VRAM is a wasted measurement.
-- **Model repos, exact strings:** `unsloth/gemma-4-12b-it`, `unsloth/Qwen3.6-27B`. Not the `-NVFP4` variants (NVIDIA Blackwell only), not the `-MLX-` variants (Apple Silicon only).
+- **Model repos, exact strings:** `unsloth/gemma-4-12b-it`, `unsloth/gpt-oss-20b-unsloth-bnb-4bit`. Not the `-NVFP4` variants (NVIDIA Blackwell only), not the `-MLX-` variants (Apple Silicon only).
+- **`unsloth/Qwen3.6-27B` was DROPPED 2026-07-22**, before any probing. 16 frontier one-shot HTML artifacts measure 5,331-15,273 tokens (median 7,909, p90 11,865); 27B's estimated ~4k ceiling fits **0 of 16**. Its ~54 GB bf16 download also exceeded free disk. See spec finding 2.
+- **0A pass bar:** measured `max_seqlen` < 8,192 disqualifies a candidate; >= 12,288 is needed to cover p90 of real artifact lengths.
 - **All probes write JSON to `finetune/bakeoff/results/`.** That directory is gitignored; results are reported, not committed.
 - **No network in unit tests.** Tests must pass with the GPU busy and the network down.
 - **Commit message format:** `<type>: <description>` per `~/.claude/rules/git-workflow.md`. No attribution trailer.
@@ -2199,17 +2201,26 @@ $UV -m finetune.bakeoff.reasoning_probe --model unsloth/gemma-4-12b-it
 
 Expected: three JSON files in `finetune/bakeoff/results/`.
 
-- [ ] **Step 3: Run all three probes for Qwen3.6-27B**
+- [ ] **Step 3: Run all three probes for gpt-oss-20b**
 
 ```bash
 cd ~/local-chatbot
 UV=~/.unsloth/studio/unsloth_studio/bin/python
-$UV -m finetune.bakeoff.vram_probe      --model unsloth/Qwen3.6-27B
-$UV -m finetune.bakeoff.toolcall_probe  --model unsloth/Qwen3.6-27B
-$UV -m finetune.bakeoff.reasoning_probe --model unsloth/Qwen3.6-27B --max-seqlen 2048
+$UV -m finetune.bakeoff.vram_probe      --model unsloth/gpt-oss-20b-unsloth-bnb-4bit
+$UV -m finetune.bakeoff.toolcall_probe  --model unsloth/gpt-oss-20b-unsloth-bnb-4bit
+$UV -m finetune.bakeoff.reasoning_probe --model unsloth/gpt-oss-20b-unsloth-bnb-4bit
 ```
 
-Expected: three more JSON files. If the 27B VRAM probe returns `max_seqlen=0`, that is a **finding, not a failure** — record it and stop testing 27B.
+Expected: three more JSON files.
+
+**Apply the 0A pass bar before spending time on 0B.** A measured `max_seqlen`
+below 8,192 disqualifies the candidate outright — real one-shot artifacts measure
+5,331-15,273 tokens (median 7,909, p90 11,865), so a sub-8k ceiling cannot hold a
+median document. If a candidate fails 0A, that is a **finding, not a failure**:
+record it and stop probing that model rather than running 0B on it.
+
+`unsloth/Qwen3.6-27B` is NOT in this run — it was eliminated by that measurement
+before probing (see Global Constraints and spec finding 2).
 
 - [ ] **Step 4: Generate the comparison table**
 

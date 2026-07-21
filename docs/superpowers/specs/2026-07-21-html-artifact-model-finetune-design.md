@@ -70,16 +70,49 @@ Estimated QLoRA budget, batch size 1, gradient checkpointing:
 | **Total @ 4k** | ~20 GB (tight) | ~10 GB |
 | **Total @ 8k** | ~26 GB → OOM | ~16 GB (fits) |
 
-**These are estimates, not measurements.** Phase 0 replaces them with facts.
+**The VRAM numbers above are estimates, not measurements.** Phase 0A replaces them
+with facts.
 
-The tension: a rich artifact is 3–8k tokens, so 27B risks training on truncated
-documents — teaching the model to stop mid-`<div>`. Truncation is a *correctness*
-failure, whereas insufficient capacity is a *quality* failure that degrades
-gracefully. That asymmetry argues for context length over parameter count, but
-the bake-off decides.
+**The artifact-length figure is now MEASURED (2026-07-22) and it settles the
+model-size question.** 16 frontier one-shot HTML games (Opus 4.8, GPT-5.5/5.6,
+Kimi K3, DeepSeek V4, Grok, Gemini 3.5, Fable 5, Inkling — six prompts, collected
+independently for a gallery project) were tokenized with Qwen3.6's tokenizer:
+
+| | tokens |
+|---|---|
+| min | 5,331 |
+| median | 7,909 |
+| p90 | 11,865 |
+| max | 15,273 |
+
+| context | artifacts that fit |
+|---|---|
+| 2,048 | 0 / 16 |
+| 4,096 | 0 / 16 |
+| 8,192 | 9 / 16 |
+
+The original estimate here was "3–8k tokens". Reality is 5.3k–15.3k. Consequences:
+
+- **Qwen3.6-27B is eliminated, not merely disfavoured.** At its estimated ~4k
+  ceiling it cannot represent even the SHORTEST artifact in the set. Capacity that
+  cannot be applied to a whole document is worth zero — this is not the
+  quality-vs-correctness tradeoff described in the earlier draft, it is a hard
+  inability to perform the task.
+- **8k is not sufficient either** — it covers 56%. The working target is
+  **12k–16k context**, which on ~21 GB usable points at a 12B-class model
+  (~7.5 GB weights + ~5 GB activations).
+- **Phase 0A's pass bar:** a candidate whose measured `max_seqlen` is below 8,192
+  is disqualified; below 12,288 it cannot cover p90 and should only be considered
+  if nothing better clears.
 
 Partially mitigated by finding 3: `patch_demo` turns carry diffs, not whole
-documents, so multi-turn trajectories cost less than turn count implies.
+documents, so multi-turn trajectories cost less than turn count implies. That
+helps later turns; it does not help the FIRST turn, which must emit a whole
+document and therefore sets the context requirement above.
+
+Source artifacts and the extraction/measurement script are outside this repo (they
+are the user's gallery data). Re-measure if the corpus target shifts away from
+game-style artifacts, which sit at the long end of the range.
 
 ### 3. The tool loop already exists — and unifies the two goals
 
@@ -104,16 +137,27 @@ Three consequences:
 
 ### 4. Candidate models — ROCm-viable subset
 
-| Repo | Usable here | Why |
+Revised 2026-07-22 after the artifact-length measurement in finding 2.
+
+| Repo | Status | Why |
 |---|---|---|
-| `unsloth/gemma-4-12b-it` | ✅ | bf16 HF weights, quantize at load |
-| `unsloth/Qwen3.6-27B` | ✅ | bf16 HF weights |
-| `unsloth/gemma-4-31B-it-unsloth-bnb-4bit` | ✅ | pre-quantized; "too big" control |
+| `unsloth/gemma-4-12b-it` | **primary** | bf16 HF weights (~24 GB download), quantize at load. 12B-class is the size the 12k–16k context requirement points at. |
+| `unsloth/gpt-oss-20b-unsloth-bnb-4bit` | **secondary** | Pre-quantized (~12 GB download, the only candidate that is). ~11–12 GB resident leaves ~9 GB for activations. Strong native tool-use, which is Probe 0C's whole metric. |
+| `unsloth/Qwen3.6-27B` | **dropped** | ~15 GB in 4-bit leaves ~6 GB for activations → ~4k ceiling, which fits **0 of 16** measured artifacts. Also a ~54 GB bf16 download against ~50 GB free disk. Eliminated before probing. |
+| `unsloth/gemma-4-31B-it-unsloth-bnb-4bit` | dropped | Same squeeze as 27B, worse. |
 | `*-NVFP4` | ❌ | NVIDIA Blackwell FP4, needs sm_100 |
 | `*-MLX-*` | ❌ | Apple Silicon only |
 
-`Qwen3.6-35B-A3B` is excluded: MoE keeps all experts resident (~18 GB in 4-bit),
-so it loses to the same squeeze as 27B despite 3B active parameters.
+**Rule for MoE candidates:** count TOTAL parameters for training memory, ACTIVE
+parameters for speed. Active-parameter counts do not reduce QLoRA VRAM — every
+expert stays resident and receives gradients. This excludes `Qwen3.6-35B-A3B`
+(~18 GB in 4-bit) and `gemma-4-26B-A4B` (~13–14 GB), both of which land back in
+the 27B squeeze despite small active counts. `gpt-oss-20b` survives the rule on
+its total size, not its 3.6B active.
+
+`diffusiongemma-26B-A4B` is out of scope: it is a text-DIFFUSION model, and
+unsloth's `FastLanguageModel` + `SFTTrainer` path targets autoregressive causal
+LMs. Would need verification before any attempt; treat as a separate project.
 
 ## Architecture — four phases
 
