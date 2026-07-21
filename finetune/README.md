@@ -50,6 +50,75 @@ repo root. Script form (`python finetune/bakeoff/vram_probe.py`) puts
   length they are about to use, but they will not override an explicit
   `--max-seqlen`.
 
+## Recommended order: cheap probes first
+
+Do NOT run all three probes on all candidates up front. 0B costs roughly 4x what
+0A and 0C cost together, because it generates 200 times per model (100 GSM8K rows,
+scored before AND after the smoke LoRA). Run the cheap probes across every
+candidate first and let them eliminate models before paying for 0B.
+
+**Stage 1 — 0A + 0C on every candidate (~20 min each).**
+
+```bash
+UV=~/.unsloth/studio/unsloth_studio/bin/python
+for M in unsloth/gemma-4-12b-it unsloth/gpt-oss-20b-unsloth-bnb-4bit; do
+  $UV -m finetune.bakeoff.vram_probe     --model "$M"
+  $UV -m finetune.bakeoff.toolcall_probe --model "$M"
+done
+$UV -m finetune.bakeoff.report
+```
+
+Eliminate here if a candidate's `max_seqlen` ceiling is too low to hold a whole
+artifact, or its `native_rate` is poor. Either is disqualifying on its own and
+costs ~20 minutes to learn instead of ~105.
+
+**Stage 2 — 0B only on survivors.**
+
+```bash
+$UV -m finetune.bakeoff.reasoning_probe --model <surviving-model>
+```
+
+### Rough cost per candidate
+
+Estimates, not measurements — generation throughput on this card has not been
+benchmarked for these models. Treat as order-of-magnitude.
+
+| | gemma-12b | gpt-oss-20b | Qwen-27B |
+|---|---|---|---|
+| 0A vram | ~10 min | ~12 min | ~20 min |
+| 0C toolcall | ~6 min | ~7 min | ~12 min |
+| 0B reasoning | ~35 min | ~40 min | ~75 min |
+| **compute total** | **~50 min** | **~60 min** | **~105 min** |
+
+0A spends most of its time reloading the model at each binary-search step (~6
+full loads). That is deliberate: reloading is the only reliable way to guarantee
+a clean allocator state between OOM attempts, and a leaked allocation would
+silently lower the measured ceiling.
+
+### Disk, before you start
+
+`load_in_4bit=True` against a plain HF repo downloads the **full bf16 weights**
+and quantizes at load. Only gpt-oss-20b has a pre-quantized `bnb-4bit` repo.
+
+| Model | Download |
+|---|---|
+| `unsloth/gemma-4-12b-it` | ~24 GB (bf16) |
+| `unsloth/gpt-oss-20b-unsloth-bnb-4bit` | ~12 GB (4-bit) |
+| `unsloth/Qwen3.6-27B` | **~54 GB (bf16)** |
+
+Check free space on whatever `HF_HOME` resolves to (default `~/.cache/huggingface`)
+before starting. As of 2026-07-21 that drive had ~50 GB free, which fits the first
+two but **not** Qwen3.6-27B. Free space or redirect `HF_HOME` before adding 27B —
+and note that Stage 1 may eliminate it anyway, so run the smaller two first and
+decide afterwards whether 54 GB is worth clearing.
+
+### Shrinking the run
+
+`--n` (default 100 GSM8K rows) dominates 0B. `--n 50` roughly halves it. The cost
+is precision: at n=50 each accuracy carries ~+/-7pp binomial noise, and `retention`
+is a ratio of two such estimates — so small differences between candidates stop
+meaning anything. Prefer eliminating candidates in Stage 1 over lowering `--n`.
+
 ## Interpreting the table
 
 - **Rank on `retention`, never on raw accuracy.** The GSM8K "last number wins"
