@@ -533,6 +533,13 @@ def test_native_detected_with_surrounding_prose():
 
 
 def test_op_block_is_fallback():
+    text = '```op:preview_demo\n{"html": "<html></html>"}\n```'
+    assert classify_response(text) == "fallback"
+
+
+def test_unfenced_op_block_is_fallback():
+    # Back-compat: some earlier prompt revisions asked for the bare
+    # `op:<name> {...}` form with no code fence. Still counts as fallback.
     text = 'op:preview_demo {"html": "<html></html>"}'
     assert classify_response(text) == "fallback"
 
@@ -557,6 +564,58 @@ def test_native_wins_when_both_present():
 
 def test_empty_string_is_none():
     assert classify_response("") == "none"
+
+
+def test_bare_json_call_followed_by_prose_with_stray_brace_is_native():
+    # A greedy first-`{`-to-last-`}` regex would span from the tool call's
+    # opening brace all the way to the brace in "{like colors}", producing a
+    # blob that fails to parse as JSON at all.
+    text = (
+        '{"name": "preview_demo", "arguments": {"html": "<p>hi</p>"}}\n\n'
+        "Tell me if you want changes {like colors}."
+    )
+    assert classify_response(text) == "native"
+
+
+def test_two_bare_json_tool_calls_in_one_response_is_native():
+    # A greedy regex spans from the first `{` to the LAST `}` here, capturing
+    # both objects concatenated together, which is not valid JSON.
+    text = (
+        '{"name":"preview_demo","arguments":{"html":"<p>1</p>"}}\n'
+        '{"name":"save_demo","arguments":{"demo_id":"d1"}}'
+    )
+    assert classify_response(text) == "native"
+
+
+def test_js_object_literal_with_name_and_arguments_keys_in_code_fence_is_native():
+    # The probe prompts ask the model to write HTML/JS demos, so generated
+    # source commonly contains object literals. If such a literal happens to
+    # be valid JSON *and* happens to use exactly the keys "name" and
+    # "arguments", it is structurally identical to a real bare-JSON tool
+    # call under this module's own definition of one (Task 4 interface:
+    # "a bare JSON object with name and arguments") — there is no reliable
+    # surface-syntax signal that distinguishes "demo source that coincidentally
+    # matches" from "an actual tool call the model meant to make". We choose
+    # NATIVE rather than trying to special-case code fences, since fence-aware
+    # exclusion would also suppress genuine tool calls that some models wrap
+    # in ```json fences, which is a worse failure mode for this measurement.
+    text = (
+        "Here's your demo:\n"
+        "```html\n"
+        "<script>\n"
+        'const sceneConfig = {"name": "particle-system", "arguments": {"count": 500}};\n'
+        "</script>\n"
+        "```"
+    )
+    assert classify_response(text) == "native"
+
+
+def test_native_wins_over_fenced_op_block():
+    text = (
+        '```op:preview_demo\n{"html":"x"}\n```\n'
+        '<tool_call>{"name":"preview_demo","arguments":{"html":"x"}}</tool_call>'
+    )
+    assert classify_response(text) == "native"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -574,29 +633,59 @@ Create `finetune/bakeoff/classify.py`:
 ```python
 """Classify a model response as native tool call, op: fallback, or neither.
 
-Mirrors what backend/app.py accepts. Model families differ in surface syntax
-(Qwen emits <tool_call> tags, others emit bare JSON), so both count as native.
-The `op:<name> {...}` form is the degraded client-side-parsed path we are
-trying to make unnecessary.
+Mirrors what backend/app.py + frontend/app.js actually accept. Model families
+differ in surface syntax (Qwen emits <tool_call> tags, others emit bare JSON),
+so both count as native. The fallback path is the fenced ```op:<name>\\n{...}
+form backend/app.py's operations prompt block instructs non-tool-calling
+models to emit (see `_operations_prompt_block`), which frontend/app.js parses
+with `OP_FENCE_RE`. The older unfenced `op:<name> {...}` form is also accepted
+for back-compat with earlier prompt revisions.
 """
 import json
 import re
 
 _TOOL_CALL_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-_OP_BLOCK = re.compile(r"^\s*op:([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+_OP_FENCED = re.compile(r"```op:[A-Za-z_][A-Za-z0-9_]*\s*\n")
+_OP_UNFENCED = re.compile(r"^\s*op:([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
 
 NATIVE = "native"
 FALLBACK = "fallback"
 NONE = "none"
 
 
-def _is_tool_call_payload(raw: str) -> bool:
+def _is_tool_call_payload(obj: object) -> bool:
+    return isinstance(obj, dict) and "name" in obj and "arguments" in obj
+
+
+def _payload_from_string(raw: str) -> bool:
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError):
         return False
-    return isinstance(obj, dict) and "name" in obj and "arguments" in obj
+    return _is_tool_call_payload(obj)
+
+
+def _has_bare_json_tool_call(text: str) -> bool:
+    """Scan every ``{`` position for a standalone decodable JSON object.
+
+    A single greedy regex spanning the first ``{`` to the last ``}`` in the
+    whole response does not isolate one JSON object — any stray brace
+    elsewhere (trailing prose, a second tool call) breaks the parse or
+    silently merges unrelated objects. Trying at each ``{`` with
+    ``json.JSONDecoder.raw_decode`` lets the real JSON grammar find each
+    object's true extent instead of guessing with a regex.
+    """
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text, idx)
+        except ValueError:
+            continue
+        if _is_tool_call_payload(obj):
+            return True
+    return False
 
 
 def classify_response(text: str) -> str:
@@ -604,14 +693,13 @@ def classify_response(text: str) -> str:
         return NONE
 
     for match in _TOOL_CALL_TAG.findall(text):
-        if _is_tool_call_payload(match):
+        if _payload_from_string(match):
             return NATIVE
 
-    candidate = _JSON_OBJECT.search(text)
-    if candidate and _is_tool_call_payload(candidate.group(0)):
+    if _has_bare_json_tool_call(text):
         return NATIVE
 
-    if _OP_BLOCK.search(text):
+    if _OP_FENCED.search(text) or _OP_UNFENCED.search(text):
         return FALLBACK
 
     return NONE
@@ -623,7 +711,7 @@ def classify_response(text: str) -> str:
 cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_classify.py -v
 ```
 
-Expected: 9 tests PASS.
+Expected: 14 tests PASS.
 
 - [ ] **Step 5: Commit**
 
