@@ -811,6 +811,96 @@ def test_unterminated_tool_call_tag_then_bare_json_call_is_native():
         'Anyway, {"name": "preview_demo", "arguments": {"html": "<p>hi</p>"}}'
     )
     assert classify_response(text) == "native"
+
+
+def test_surviving_reproducer_is_fast_and_none():
+    # Round 5 finding: `_has_bare_json_tool_call` scanned every `{` with
+    # `json.JSONDecoder.raw_decode`, whose failure path constructs a
+    # `json.JSONDecodeError` -- and that constructor computes
+    # `doc.count("\n", 0, pos)`, O(position-in-document), on EVERY failed
+    # attempt. This fragment passes both round-3/4 pre-filters (object-start
+    # shape check, AND contains both the "name" and "arguments" literals)
+    # but never has a closing brace, so every one of the n attempts fails,
+    # each paying an O(pos) cost that grows as the scan gets deeper into the
+    # document -- O(n^2) overall.
+    #
+    # Measured on the pre-round-5 code with this exact repro: 180KB->0.151s
+    # (0.82 us/char), 359KB->0.585s (1.59 us/char), 719KB->2.304s
+    # (3.13 us/char) -- us/char growing with size is the quadratic
+    # signature.
+    #
+    # Bound: 0.5s has enormous headroom over the low tens of milliseconds a
+    # true O(1)-per-failure scan should take at this size, while sitting
+    # more than 4x below the pre-fix quadratic time here (2.3s) -- not
+    # flaky, but still catches a regression back to O(n^2).
+    frag = '{"name":"a","arguments"'
+    text = frag * 32000
+    assert len(text) > 700_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 0.5
+
+
+def test_surviving_reproducer_scales_linearly():
+    # A "fast at one size" assertion alone would not have caught rounds
+    # 2/3/4 regressing -- each of those rounds' fixes was ALSO fast at the
+    # size it was tuned against, and each was still O(n^2) underneath
+    # (just with a smaller constant / a narrower trigger). This test
+    # measures cost-per-character at two sizes 4x apart on the round-5
+    # reproducer and asserts the ratio stays close to flat: genuine O(n)
+    # work means us/char is roughly constant regardless of n; O(n^2) work
+    # means us/char grows roughly linearly with n (so a 4x size increase
+    # would show a ~4x us/char increase, as it did pre-fix: 0.82 -> 3.13,
+    # a ~3.8x jump). 2.5x is a generous margin above "flat" (1.0x) while
+    # sitting well below the ~3.8x pre-fix growth, so this fails loudly on
+    # a regression back to quadratic without being flaky about ordinary
+    # constant-factor noise between runs.
+    frag = '{"name":"a","arguments"'
+
+    small_text = frag * 8000
+    start = time.perf_counter()
+    classify_response(small_text)
+    small_elapsed = time.perf_counter() - start
+    small_us_per_char = small_elapsed / len(small_text) * 1e6
+
+    large_text = frag * 32000
+    start = time.perf_counter()
+    classify_response(large_text)
+    large_elapsed = time.perf_counter() - start
+    large_us_per_char = large_elapsed / len(large_text) * 1e6
+
+    assert large_us_per_char < small_us_per_char * 2.5
+
+
+def test_deeply_nested_bare_json_via_scan_once_is_none_without_runtimeerror():
+    # PEP 479 guard: an escaping `StopIteration` inside a generator's frame
+    # gets converted into a `RuntimeError` at the yield point. This module's
+    # `_iter_tool_call_payloads` IS a generator (round 4), so any code that
+    # can raise a bare `StopIteration` (as `json.JSONDecoder.scan_once` does
+    # on a failed match, unlike `raw_decode` which wraps it into
+    # `JSONDecodeError`) must be caught airtight, or a failure could
+    # surface as a confusing `RuntimeError` instead of classify_response's
+    # documented total "never raises" contract.
+    #
+    # This text is shaped to actually reach the bare-JSON scan_once call
+    # (not just the tag-pair scan): it contains no `<tool_call>` tags, but
+    # does contain the literal substrings `"name"` and `"arguments"` so the
+    # round-3/4 pre-filters don't skip it, and opens 20,000 nested objects
+    # keyed `"name"` before ever reaching the `"arguments"` key or a
+    # closing brace -- deep enough to trip CPython's json scanner's
+    # internal recursion guard (RecursionError, not StopIteration, but the
+    # same "must not escape and must not corrupt into RuntimeError" class
+    # of failure).
+    depth = 20000
+    text = '{"name":' * depth + '"arguments":1' + "}" * depth
+
+    result = classify_response(text)
+
+    assert result == "none"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -952,6 +1042,51 @@ def _looks_like_json_object_start(text: str, idx: int) -> bool:
     return j < n and text[j] in ('"', "}")
 
 
+class _CheapFailureDoc(str):
+    """A ``str`` subclass that makes a failed decode's exception O(1).
+
+    ROOT CAUSE (round 5): every prior round (2, 3, 4) narrowed *which*
+    ``{`` positions reach the JSON decoder, but never touched the actual
+    cost of a *failed* decode there, so each round a new input shape that
+    slipped past the latest pre-filter reproduced the same O(n^2) blowup.
+    The real cost sits in ``json.JSONDecodeError.__init__``, which computes
+    ``doc.count("\\n", 0, pos)`` and ``doc.rfind("\\n", 0, pos)`` — both
+    O(position-in-document) — every time it's constructed. That happens on
+    *every* failed attempt, regardless of which decoder entry point
+    triggered it: not only the "Expecting value" case (which
+    ``json.JSONDecoder.raw_decode`` builds by wrapping a cheap
+    ``StopIteration``), but also structural errors raised *directly* deep
+    inside object parsing (e.g. "Expecting ':' delimiter") — which
+    ``scan_once`` raises as a full ``JSONDecodeError`` too, at the exact
+    same O(pos) cost. This was verified directly against this
+    interpreter's C-accelerated scanner: for the round-5 surviving
+    reproducer below, ``scan_once`` and ``raw_decode`` cost the *same*
+    (~28ms per 200 failing attempts at a position ~736,000 chars in) —
+    switching decoder methods alone does not fix this input shape.
+
+    `_has_bare_json_tool_call` never reads a raised exception's message,
+    ``.lineno``, or ``.colno`` — it only branches on the exception's type.
+    So the correctness of those fields is irrelevant here; only their cost
+    is. Wrapping `text` in this subclass ONCE (a single O(n) copy, done
+    once per `_has_bare_json_tool_call` call — not once per candidate
+    position) makes `count`/`rfind` O(1) stubs instead of real O(pos)
+    scans, so every failed-decode exception this scan constructs is O(1)
+    to build no matter how deep into the document it fails. That removes
+    the root cause structurally: it no longer matters how many positions
+    make it past the pre-filters below, or what specific error message the
+    decoder raises at each one — a failure is cheap everywhere in the
+    document, not just near its start.
+    """
+
+    __slots__ = ()
+
+    def count(self, *_args, **_kwargs) -> int:
+        return 0
+
+    def rfind(self, *_args, **_kwargs) -> int:
+        return -1
+
+
 def _has_bare_json_tool_call(text: str) -> bool:
     """Scan every ``{`` position for a standalone decodable JSON object.
 
@@ -959,41 +1094,28 @@ def _has_bare_json_tool_call(text: str) -> bool:
     whole response does not isolate one JSON object — any stray brace
     elsewhere (trailing prose, a second tool call) breaks the parse or
     silently merges unrelated objects. Trying at each ``{`` with
-    ``json.JSONDecoder.raw_decode`` lets the real JSON grammar find each
-    object's true extent instead of guessing with a regex.
+    ``json.JSONDecoder.scan_once`` (the decoder's underlying scanner) lets
+    the real JSON grammar find each object's true extent instead of
+    guessing with a regex.
 
-    Three things can make this scan blow up on adversarial or merely
-    brace-dense input, and all three are handled here:
+    Two things narrow which positions even reach the decoder — cheap
+    performance filters now, not correctness-critical after round 5 (see
+    below), but still worth keeping since they avoid pointless scanner
+    calls on the majority of brace-dense non-JSON positions:
 
-    - Deeply-nested JSON makes ``raw_decode`` raise ``RecursionError``, not
-      ``ValueError`` (`RecursionError` is a `RuntimeError` subclass). Left
-      uncaught this would abort the whole scan for one degenerate response.
-      Caught per-position (not at the top of `classify_response`), a
-      RecursionError at one `{` still lets the scan continue and find a
-      genuine tool call elsewhere in the same text.
     - Brace-dense non-JSON text whose ``{`` is not even shaped like an
       object opening (CSS rule blocks, JS control-flow blocks) is pruned by
-      `_looks_like_json_object_start` before `raw_decode` is ever called.
-    - Brace-dense text that DOES look like an object opening (``{"`` or
-      ``{}``) but fails to decode (trailing comma, single-quoted keys, an
-      unterminated string cut off mid-generation) still reaches
-      `raw_decode`, and a *failed* `raw_decode` constructs a
-      `json.JSONDecodeError`, whose line/column computation
-      (``doc.count("\\n", 0, pos)``) is O(position-in-document). Summed over
-      every such position that's just object-shaped-but-invalid, that's
-      O(n^2) again — this is the round-3 finding, reproduced by an ordinary
-      trailing-comma JS object literal repeated across a large document.
-
-      The fix: a real tool call payload is a dict with both a "name" key
-      and an "arguments" key (`_is_tool_call_payload`). This pre-filter
-      ASSUMES those keys are written literally as the substrings ``"name"``
-      and ``"arguments"`` in the source text — true whenever a model emits
+      `_looks_like_json_object_start` before the decoder is ever called.
+    - A real tool call payload is a dict with both a "name" key and an
+      "arguments" key (`_is_tool_call_payload`). This pre-filter ASSUMES
+      those keys are written literally as the substrings ``"name"`` and
+      ``"arguments"`` in the source text — true whenever a model emits
       ordinary ASCII key names un-escaped, which is how every model this
       probe has observed writes JSON, but NOT a property JSON's grammar
       guarantees. A key can legally be written with a `\\u` escape (e.g.
       ``"na\\u006de"`` decodes to ``"name"``), in which case the literal
       substring ``"name"`` never appears in the source text at all, and
-      this pre-filter will skip `raw_decode` at that position — even though
+      this pre-filter will skip the decoder at that position — even though
       the object genuinely would decode to a valid tool call payload.
 
       KNOWN ACCEPTED LIMITATION, not a bug to fix here: such an object is
@@ -1004,26 +1126,49 @@ def _has_bare_json_tool_call(text: str) -> bool:
       knowing whether a `{` is even JSON-shaped is not worth the
       complexity for a shape that hasn't been observed in practice.
 
-      Given that assumption holds, if the literal substring ``"name"``
-      does not occur anywhere in `text` at or after `idx`, no object
-      starting at `idx` can be a tool call payload (under the assumption),
-      and `raw_decode` is skipped — same for ``"arguments"``. The last
-      occurrence of each substring in the whole text (`str.rfind`,
-      computed once, O(n)) is enough for the "at or after idx" check:
-      `idx <= last_occurrence` is a valid over-approximation (it may still
-      attempt a decode that turns out to fail, but it can never skip a
-      position that could genuinely succeed under the assumption, since
-      such a key literally lives at some position >= idx, so the LAST such
-      position is also >= idx).
+      The last occurrence of each substring in the whole text
+      (`str.rfind`, computed once, O(n)) bounds which positions can
+      possibly succeed: `idx <= last_occurrence` for both "name" and
+      "arguments" is a valid over-approximation (it may still attempt a
+      decode that turns out to fail, but it can never skip a position that
+      could genuinely succeed under the assumption).
 
-      This is sound (given the assumption) but not a complete defense
-      against every conceivable adversarial input: a document that
-      densely repeats BOTH literal substrings ``"name"`` and
-      ``"arguments"`` alongside many invalid-JSON-shaped braces could
-      still accumulate failed-decode cost. That shape does not match any
-      of the round-3 finding's reproducers (trailing comma, single-quoted
-      key, truncated data-URI) or this probe's real input distribution
-      (model-generated HTML/CSS/JS demos), so it's out of scope here.
+    Neither filter is (or needs to be) a *complete* defense against every
+    conceivable adversarial brace-dense input — that used to matter a
+    great deal, because a failed decode that slipped past both filters
+    cost O(position-in-document). Round 5 removed that dependency: thanks
+    to `_CheapFailureDoc`, a failed decode is O(1) everywhere in the
+    document, so a position that slips through these filters just costs a
+    cheap, bounded scanner attempt, not a potential O(n^2) blowup. The
+    round-5 surviving reproducer — ``'{"name":"a","arguments"' * n``, which
+    passes both filters above (object-start shaped, contains both literal
+    substrings) but never has a closing brace — is exactly this case: it
+    still reaches the decoder at every qualifying position, but each
+    failure is now cheap regardless of how far into the document it is.
+
+    Two exception types still need explicit handling per position (not
+    just at the top of `classify_response`), since either one at a single
+    `{` must not abort the scan for the rest of the text:
+
+    - `scan_once` raises a bare `StopIteration` (not wrapped into
+      `JSONDecodeError`) for its own "no value here" case. This function is
+      an ordinary function, not a generator, so catching `StopIteration`
+      here is unremarkable — but this scan is invoked from
+      `classify_response`, which is itself called per-candidate from a
+      probe driver loop, not from inside `_iter_tool_call_payloads`'s
+      generator frame (that generator never touches JSON decoding at all),
+      so there is no PEP 479 escaping-`StopIteration`-becomes-`RuntimeError`
+      risk here regardless.
+    - Deeply-nested JSON makes the scanner raise `RecursionError`, not
+      `ValueError` (`RecursionError` is a `RuntimeError` subclass). Left
+      uncaught this would abort the whole scan for one degenerate
+      response. Caught per-position, a RecursionError at one `{` still
+      lets the scan continue and find a genuine tool call elsewhere in the
+      same text.
+
+    `json.JSONDecodeError` is itself a `ValueError` subclass, so catching
+    `(StopIteration, ValueError, RecursionError)` covers every failure mode
+    the scanner is documented to raise.
     """
     last_name_pos = text.rfind('"name"')
     if last_name_pos == -1:
@@ -1032,15 +1177,16 @@ def _has_bare_json_tool_call(text: str) -> bool:
     if last_arguments_pos == -1:
         return False
 
-    decoder = json.JSONDecoder()
+    cheap_text = _CheapFailureDoc(text)
+    scan_once = json.JSONDecoder().scan_once
     for idx, ch in enumerate(text):
         if ch != "{" or not _looks_like_json_object_start(text, idx):
             continue
         if idx > last_name_pos or idx > last_arguments_pos:
             continue
         try:
-            obj, _end = decoder.raw_decode(text, idx)
-        except (ValueError, RecursionError):
+            obj, _end = scan_once(cheap_text, idx)
+        except (StopIteration, ValueError, RecursionError):
             continue
         if _is_tool_call_payload(obj):
             return True
@@ -1126,6 +1272,90 @@ cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest fine
 ```
 
 Expected: 23 tests PASS.
+
+**Round 5 hardening (post-launch, removes the ROOT CAUSE, not just another
+narrowing):** Rounds 2, 3, and 4 each narrowed *which* `{` positions could
+reach `_has_bare_json_tool_call`'s decode attempt, but never touched the
+actual cost of a *failed* decode there — so each round, a new input shape
+that slipped past the latest pre-filter reproduced the same O(n^2) blowup.
+The surviving reproducer, `'{"name":"a","arguments"' * n` (no closing brace,
+never valid), passes BOTH the object-start shape check and the round-3/4
+"name"/"arguments" literal-substring pre-filter, and reached
+`json.JSONDecoder.raw_decode` at every qualifying position — 719KB measured
+at 2.304s (3.13 us/char, growing with size — the quadratic signature) on the
+pre-round-5 code.
+
+The true root cause: a *failed* decode constructs a `json.JSONDecodeError`,
+whose `__init__` computes `doc.count("\n", 0, pos)` and
+`doc.rfind("\n", 0, pos)` — both O(position-in-document) — every time it's
+raised, summed over every failing position in a large document. Critically,
+this is **not** limited to the "Expecting value" case that `raw_decode`
+builds by wrapping a cheap `StopIteration` — verified directly against this
+interpreter's C-accelerated json scanner (CPython 3.13), `scan_once` raises
+a full `JSONDecodeError` directly (not `StopIteration`) for structural
+errors found deep inside object parsing too (e.g. "Expecting ':' delimiter",
+exactly what the surviving reproducer hits), at the *same* O(pos) cost as
+`raw_decode` — switching decoder methods alone does not fix this input
+shape (measured: both cost ~28ms per 200 failing attempts at position
+~736,000 in a 719KB document).
+
+The fix that actually works: a private `_CheapFailureDoc(str)` subclass
+whose `count`/`rfind` are overridden to O(1) stubs, wrapping `text` in it
+ONCE per `_has_bare_json_tool_call` call (a single O(n) copy) before the
+scan loop. `_has_bare_json_tool_call` never reads a raised exception's
+message, `.lineno`, or `.colno` — only its type — so the real line/column
+computation was pure wasted cost. With this wrapper, constructing a
+`JSONDecodeError` (or catching a bare `StopIteration`, now also handled
+since the scan calls `scan_once` directly instead of `raw_decode`) is O(1)
+everywhere in the document, removing the dependency on which pre-filter
+catches which input shape: a position that slips through the shape/literal
+pre-filters now costs a cheap, bounded scanner attempt instead of a
+potential O(n^2) blowup. The pre-filters stay (still avoid pointless scanner
+calls on the common case), but the docstring no longer claims they are
+load-bearing for complexity — `_CheapFailureDoc` is.
+
+Verified flat (not just fast at one size) — us/char at four sizes on the
+surviving reproducer, before vs after:
+
+| size (KB) | before (s) | before us/char | after (s) | after us/char |
+|-----------|-----------|-----------------|-----------|----------------|
+| 180       | 0.157     | 0.851           | 0.0107    | 0.058          |
+| 359       | 0.599     | 1.627           | 0.0232    | 0.063          |
+| 539       | 1.378     | 2.496           | 0.0320    | 0.058          |
+| 719       | 2.392     | 3.249           | 0.0436    | 0.059          |
+
+`before` grows ~3.8x over a 4x size increase (quadratic); `after` stays
+flat at ~0.06 us/char regardless of size (linear) — roughly 55x faster at
+719KB. Three new tests were added (bringing the suite to **26 tests**, up
+from 23): `test_surviving_reproducer_is_fast_and_none` (the reproducer
+completes in well under 0.5s, down from the pre-fix 2.3s),
+`test_surviving_reproducer_scales_linearly` (measures us/char at two sizes
+4x apart and asserts the ratio stays within 2.5x — the specific check that
+would have caught rounds 2/3/4 regressing, since each of those was also
+"fast at one size" while still quadratic underneath), and
+`test_deeply_nested_bare_json_via_scan_once_is_none_without_runtimeerror`
+(guards the PEP 479 concern: `scan_once` can raise a bare `StopIteration`,
+and `_iter_tool_call_payloads` is a generator, so exception handling around
+any `scan_once` call must be airtight or a failure could surface as
+`RuntimeError` instead of the documented total "never raises" contract —
+confirmed this module's `scan_once` usage lives in `_has_bare_json_tool_call`,
+an ordinary function, not inside that generator's frame, so no such
+conversion can occur, and the test proves it: "none", no exception).
+
+Audit of other `JSONDecodeError`-construction sites in this module:
+`_payload_from_string`'s `json.loads(raw)` (used by `_iter_tool_call_payloads`
+for `<tool_call>` tag content) was checked for the same class of bug and
+found NOT reachable in a way that causes quadratic cost — it is called once
+per tag pair, and any `JSONDecodeError` it constructs is bounded by that
+pair's OWN content length (`raw`, not the whole original `text`), so the
+sum of per-call costs across all tag pairs in one document is at most O(n)
+total, never O(n^2). No change was needed there.
+
+```bash
+cd ~/local-chatbot && ~/.unsloth/studio/unsloth_studio/bin/python -m pytest finetune/tests/test_classify.py -v
+```
+
+Expected: 26 tests PASS.
 
 ---
 

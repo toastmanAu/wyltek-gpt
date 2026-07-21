@@ -295,3 +295,93 @@ def test_unterminated_tool_call_tag_then_bare_json_call_is_native():
         'Anyway, {"name": "preview_demo", "arguments": {"html": "<p>hi</p>"}}'
     )
     assert classify_response(text) == "native"
+
+
+def test_surviving_reproducer_is_fast_and_none():
+    # Round 5 finding: `_has_bare_json_tool_call` scanned every `{` with
+    # `json.JSONDecoder.raw_decode`, whose failure path constructs a
+    # `json.JSONDecodeError` -- and that constructor computes
+    # `doc.count("\n", 0, pos)`, O(position-in-document), on EVERY failed
+    # attempt. This fragment passes both round-3/4 pre-filters (object-start
+    # shape check, AND contains both the "name" and "arguments" literals)
+    # but never has a closing brace, so every one of the n attempts fails,
+    # each paying an O(pos) cost that grows as the scan gets deeper into the
+    # document -- O(n^2) overall.
+    #
+    # Measured on the pre-round-5 code with this exact repro: 180KB->0.151s
+    # (0.82 us/char), 359KB->0.585s (1.59 us/char), 719KB->2.304s
+    # (3.13 us/char) -- us/char growing with size is the quadratic
+    # signature.
+    #
+    # Bound: 0.5s has enormous headroom over the low tens of milliseconds a
+    # true O(1)-per-failure scan should take at this size, while sitting
+    # more than 4x below the pre-fix quadratic time here (2.3s) -- not
+    # flaky, but still catches a regression back to O(n^2).
+    frag = '{"name":"a","arguments"'
+    text = frag * 32000
+    assert len(text) > 700_000
+
+    start = time.perf_counter()
+    result = classify_response(text)
+    elapsed = time.perf_counter() - start
+
+    assert result == "none"
+    assert elapsed < 0.5
+
+
+def test_surviving_reproducer_scales_linearly():
+    # A "fast at one size" assertion alone would not have caught rounds
+    # 2/3/4 regressing -- each of those rounds' fixes was ALSO fast at the
+    # size it was tuned against, and each was still O(n^2) underneath
+    # (just with a smaller constant / a narrower trigger). This test
+    # measures cost-per-character at two sizes 4x apart on the round-5
+    # reproducer and asserts the ratio stays close to flat: genuine O(n)
+    # work means us/char is roughly constant regardless of n; O(n^2) work
+    # means us/char grows roughly linearly with n (so a 4x size increase
+    # would show a ~4x us/char increase, as it did pre-fix: 0.82 -> 3.13,
+    # a ~3.8x jump). 2.5x is a generous margin above "flat" (1.0x) while
+    # sitting well below the ~3.8x pre-fix growth, so this fails loudly on
+    # a regression back to quadratic without being flaky about ordinary
+    # constant-factor noise between runs.
+    frag = '{"name":"a","arguments"'
+
+    small_text = frag * 8000
+    start = time.perf_counter()
+    classify_response(small_text)
+    small_elapsed = time.perf_counter() - start
+    small_us_per_char = small_elapsed / len(small_text) * 1e6
+
+    large_text = frag * 32000
+    start = time.perf_counter()
+    classify_response(large_text)
+    large_elapsed = time.perf_counter() - start
+    large_us_per_char = large_elapsed / len(large_text) * 1e6
+
+    assert large_us_per_char < small_us_per_char * 2.5
+
+
+def test_deeply_nested_bare_json_via_scan_once_is_none_without_runtimeerror():
+    # PEP 479 guard: an escaping `StopIteration` inside a generator's frame
+    # gets converted into a `RuntimeError` at the yield point. This module's
+    # `_iter_tool_call_payloads` IS a generator (round 4), so any code that
+    # can raise a bare `StopIteration` (as `json.JSONDecoder.scan_once` does
+    # on a failed match, unlike `raw_decode` which wraps it into
+    # `JSONDecodeError`) must be caught airtight, or a failure could
+    # surface as a confusing `RuntimeError` instead of classify_response's
+    # documented total "never raises" contract.
+    #
+    # This text is shaped to actually reach the bare-JSON scan_once call
+    # (not just the tag-pair scan): it contains no `<tool_call>` tags, but
+    # does contain the literal substrings `"name"` and `"arguments"` so the
+    # round-3/4 pre-filters don't skip it, and opens 20,000 nested objects
+    # keyed `"name"` before ever reaching the `"arguments"` key or a
+    # closing brace -- deep enough to trip CPython's json scanner's
+    # internal recursion guard (RecursionError, not StopIteration, but the
+    # same "must not escape and must not corrupt into RuntimeError" class
+    # of failure).
+    depth = 20000
+    text = '{"name":' * depth + '"arguments":1' + "}" * depth
+
+    result = classify_response(text)
+
+    assert result == "none"
