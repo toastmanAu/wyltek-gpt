@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
   role       TEXT NOT NULL,
   content    TEXT NOT NULL,
   tokens     INTEGER,
+  model      TEXT,
   created    REAL NOT NULL,
   PRIMARY KEY (session_id, seq)
 );
@@ -59,7 +60,17 @@ class SessionStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=3000")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for DBs created before a column existed.
+        CREATE TABLE IF NOT EXISTS never alters an existing table, so a store
+        opened on a pre-model-column DB needs the column added explicitly."""
+        cols = {row["name"] for row in
+                self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "model" not in cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN model TEXT")
 
     def create_session(self, model: str, title: str | None = None) -> str:
         sid = uuid.uuid4().hex
@@ -74,7 +85,7 @@ class SessionStore:
         return sid
 
     def append_message(self, session_id: str, role: str, content: str,
-                       tokens: int | None = None) -> int:
+                       tokens: int | None = None, model: str | None = None) -> int:
         now = time.time()
         with self._lock:
             row = self._conn.execute(
@@ -86,9 +97,9 @@ class SessionStore:
                 (session_id,)).fetchone()
             seq = int(seq_row["next"])
             self._conn.execute(
-                "INSERT INTO messages (session_id, seq, role, content, tokens, created) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, seq, role, content, tokens, now))
+                "INSERT INTO messages (session_id, seq, role, content, tokens, model, created) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, seq, role, content, tokens, model, now))
             self._conn.execute(
                 "UPDATE sessions SET updated = ? WHERE id = ?", (now, session_id))
             self._conn.commit()
@@ -127,10 +138,11 @@ class SessionStore:
             if srow is None:
                 return None
             rows = self._conn.execute(
-                "SELECT seq, role, content FROM messages WHERE session_id = ? ORDER BY seq",
+                "SELECT seq, role, content, model FROM messages WHERE session_id = ? ORDER BY seq",
                 (session_id,)).fetchall()
         return {"title": srow["title"], "summary": srow["summary"],
-                "messages": [{"seq": r["seq"], "role": r["role"], "content": r["content"]}
+                "messages": [{"seq": r["seq"], "role": r["role"], "content": r["content"],
+                              "model": r["model"]}
                              for r in rows]}
 
     def rename(self, session_id: str, title: str) -> None:

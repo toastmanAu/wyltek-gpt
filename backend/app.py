@@ -676,7 +676,7 @@ async def chat(payload: dict):
         if SESSIONS is not None and sess_id and assistant_parts:
             try:
                 SESSIONS.append_message(sess_id, "assistant", "".join(assistant_parts),
-                                        tokens=final_eval["tokens"])
+                                        tokens=final_eval["tokens"], model=model)
                 full = SESSIONS.get_full(sess_id)
                 if full and not full.get("title") and len(full["messages"]) <= 2:
                     _first_user = next((m.get("content", "") for m in incoming

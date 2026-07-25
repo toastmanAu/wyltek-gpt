@@ -387,12 +387,15 @@ function updateComposerMode() {
 
 // ─── messages ──────────────────────────────────────────────────────
 
-function appendMsg(role, text) {
+// `role` drives the CSS class + history semantics; `label` is the visible
+// prompt name only (defaults to role). Assistant bubbles pass the producing
+// model as the label so "assistant>" becomes e.g. "qwen3-coder:30b>".
+function appendMsg(role, text, label = role) {
   const wrap = document.createElement("div");
   wrap.className = `msg ${role}`;
   const r = document.createElement("span");
   r.className = "role";
-  r.textContent = `${role}>`;
+  r.textContent = `${label}>`;
   const c = document.createElement("span");
   c.className = "content";
   c.textContent = ` ${text}`;
@@ -1585,7 +1588,7 @@ async function send() {
 
   history.push({ role: "user", content: text });
   appendMsg("user", text);
-  const out = appendMsg("assistant", "");
+  const out = appendMsg("assistant", "", modelSel.value);
   out.parentElement.classList.add("streaming");
 
   // "Thinking" indicator — Claude-Code-style spinner + label + elapsed
@@ -1752,7 +1755,7 @@ async function send() {
 }
 
 async function autoCaptionSend(text) {
-  const out = appendMsg("assistant", "");
+  const out = appendMsg("assistant", "", modelSel.value);
   out.parentElement.classList.add("streaming");
 
   // Reuse the thinking spinner — captioner model load is the main wait.
@@ -1821,7 +1824,7 @@ async function autoCaptionSend(text) {
 }
 
 async function translateSend(text, sourceLang, targetLang) {
-  const out = appendMsg("assistant", "");
+  const out = appendMsg("assistant", "", modelSel.value);
   out.parentElement.classList.add("streaming");
 
   // Reuse the thinking-spinner pattern — first translation on a
@@ -2070,8 +2073,11 @@ function clearMessages() {
 
 // Render one stored {role, content} turn. Thin wrapper over the existing
 // appendMsg renderer (createElement + textContent — no innerHTML, no XSS).
-function renderStoredMessage(role, content) {
-  appendMsg(role, content);
+function renderStoredMessage(role, content, model) {
+  // Label assistant turns with the model that produced them (null on legacy
+  // rows predating per-message model capture — falls back to "assistant>").
+  const label = role === "assistant" && model ? model : role;
+  appendMsg(role, content, label);
 }
 
 // Start a fresh chat: drop the session binding, clear the log, and reset
@@ -2148,7 +2154,7 @@ async function openSession(id) {
   history = [{ role: "system", content: systemPrompt }];
   for (const m of full.messages || []) {
     history.push({ role: m.role, content: m.content });
-    renderStoredMessage(m.role, m.content);
+    renderStoredMessage(m.role, m.content, m.model);
   }
   loadSessions();
   closeSessionsPanel();
