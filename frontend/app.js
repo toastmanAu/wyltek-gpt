@@ -1,3 +1,5 @@
+import { iosShareFallbackFile, publishIOSShareFallback } from "./share-files.js";
+
 const $ = (sel) => document.querySelector(sel);
 const messagesEl = $("#messages");
 const modelSel = $("#model");
@@ -405,10 +407,11 @@ function appendMsg(role, text, label = role) {
   return c;
 }
 
-// iOS standalone PWA: tapping <a download> opens an embedded QuickLook preview
-// with no back button — swipe-kill is the only escape. Route through the share
-// sheet instead, which has a Cancel button and returns to the PWA cleanly.
-const IS_IOS_PWA = window.navigator.standalone === true;
+// iOS turns ordinary Blob downloads into embedded QuickLook previews whose
+// blob:-named items cannot be identified by document-handler apps. Route them
+// through Web Share as real named files in both Safari and installed PWA mode.
+const IS_IOS_BROWSER = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 async function shareInsteadOfDownload(e, href, name) {
   e.preventDefault();
@@ -423,8 +426,15 @@ async function shareInsteadOfDownload(e, href, name) {
       await navigator.share({ files: [file], title: name });
       return;
     }
-    // Web Share Level 2 unavailable on this iOS — open in mobile Safari,
-    // which at least gives the user a Done button to return.
+    const fallbackFile = await iosShareFallbackFile(file);
+    if (fallbackFile && navigator.canShare?.({ files: [fallbackFile] })) {
+      await navigator.share({ files: [fallbackFile], title: fallbackFile.name });
+      return;
+    }
+    if (fallbackFile) {
+      window.open(await publishIOSShareFallback(fallbackFile), "_blank");
+      return;
+    }
     window.open(href, "_blank");
   } catch (err) {
     if (err.name === "AbortError") return; // user tapped Cancel on share sheet
@@ -446,7 +456,7 @@ function appendDownload(role, prefix, name, href) {
   a.href = href;
   a.textContent = name;
   a.setAttribute("download", name);
-  if (IS_IOS_PWA) {
+  if (IS_IOS_BROWSER) {
     a.addEventListener("click", (e) => shareInsteadOfDownload(e, href, name));
   }
   c.appendChild(a);
@@ -997,6 +1007,42 @@ const LANG_TO_FILENAME = {
   cmake: "CMakeLists.txt",
 };
 
+// Map file extension → download MIME type. The OS/browser drives its
+// share/save options off the Blob's MIME, NOT the filename — so a
+// snippet-N.html served as text/plain only offers text-oriented targets
+// (and on iOS the share sheet inherits it via new File({type})). Only
+// markup/data/web types get a render-able MIME here; source code (py, rs,
+// go, ...) has no registered type and stays text/plain, which is what we
+// want — it opens in a viewer rather than downloading blind. Text types
+// carry charset=utf-8 to match the snippet bodies we emit.
+const EXT_TO_MIME = {
+  html: "text/html;charset=utf-8",
+  htm: "text/html;charset=utf-8",
+  svg: "image/svg+xml;charset=utf-8",
+  xml: "application/xml;charset=utf-8",
+  css: "text/css;charset=utf-8",
+  js: "application/javascript;charset=utf-8",
+  mjs: "application/javascript;charset=utf-8",
+  cjs: "application/javascript;charset=utf-8",
+  json: "application/json;charset=utf-8",
+  md: "text/markdown;charset=utf-8",
+  csv: "text/csv;charset=utf-8",
+  tsv: "text/tab-separated-values;charset=utf-8",
+  yaml: "application/yaml;charset=utf-8",
+  toml: "application/toml;charset=utf-8",
+};
+const DEFAULT_DOWNLOAD_MIME = "text/plain;charset=utf-8";
+
+// Pick a download MIME from a filename's extension, falling back to plain
+// text for anything unmapped (source code, extension-less names like
+// Dockerfile, .txt). Case-insensitive on the extension.
+function mimeForFilename(filename) {
+  const base = String(filename || "").toLowerCase();
+  const dot = base.lastIndexOf(".");
+  const ext = dot >= 0 ? base.slice(dot + 1) : "";
+  return EXT_TO_MIME[ext] || DEFAULT_DOWNLOAD_MIME;
+}
+
 // Captures ```<info>?\n...body...\n``` blocks. The info string is anything
 // up to the newline — CommonMark allows arbitrary text there ("python",
 // "file:foo.py", "python title='example'"). We parse it in parseFenceInfo
@@ -1142,7 +1188,7 @@ function appendCodeDownloads(msgWrap, blocks) {
   const row = document.createElement("div");
   row.className = "code-downloads";
   for (const b of blocks) {
-    const blob = new Blob([b.body], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([b.body], { type: mimeForFilename(b.filename) });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.className = "code-download";
@@ -1150,9 +1196,8 @@ function appendCodeDownloads(msgWrap, blocks) {
     a.download = b.filename;
     a.textContent = `⬇ ${b.filename}`;
     a.title = `${b.body.length} bytes · ${b.lang || "text"}`;
-    if (IS_IOS_PWA) {
-      a.addEventListener("click", (e) => shareInsteadOfDownload(e, url, b.filename));
-    }
+    // Leave snippet links as native anchors on iOS: tap opens the familiar
+    // preview, while long-press keeps the system link/download actions.
     row.appendChild(a);
   }
   msgWrap.appendChild(row);

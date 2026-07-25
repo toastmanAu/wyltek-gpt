@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
+import io
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
+import time
+import zipfile
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import httpx
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.bridges import cellc as cellc_bridge
@@ -64,6 +70,16 @@ _OUT_RAW = STORAGE.get("output_dir")
 OUTPUT_DIR: Path | None = (
     Path(os.path.expanduser(_OUT_RAW)).resolve() if _OUT_RAW else None
 )
+
+IOS_SHARE_MAX_BYTES = 25 * 1024 * 1024
+IOS_SHARE_TTL_SECONDS = 5 * 60
+IOS_SHARE_MAX_ENTRIES = 8
+# Bound concurrent in-flight uploads: each buffers up to IOS_SHARE_MAX_BYTES
+# before the size cap / eviction apply, so without this a burst of slow-drip
+# POSTs could hold N×25 MB simultaneously and exhaust the single worker.
+IOS_SHARE_MAX_INFLIGHT = 3
+_IOS_SHARE_SEM = asyncio.Semaphore(IOS_SHARE_MAX_INFLIGHT)
+_IOS_SHARE_FILES: dict[str, tuple[float, str, bytes]] = {}
 if OUTPUT_DIR is not None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1445,6 +1461,124 @@ async def download(session_id: str, name: str):
     if not target.exists():
         raise HTTPException(404, "not found")
     return FileResponse(target, filename=target.name)
+
+
+def _safe_ios_share_name(raw_name: str) -> str:
+    decoded = unquote(raw_name or "")
+    base = re.split(r"[\\/]", decoded)[-1]
+    base = "".join(character for character in base if ord(character) >= 32).strip()
+    base = base[:120]
+    return base if base.lower().endswith(".zip") and base not in {".zip", "..zip"} else "page.zip"
+
+
+def _purge_ios_share_files() -> None:
+    cutoff = time.monotonic() - IOS_SHARE_TTL_SECONDS
+    for token, (created_at, _, _) in list(_IOS_SHARE_FILES.items()):
+        if created_at < cutoff:
+            _IOS_SHARE_FILES.pop(token, None)
+    while len(_IOS_SHARE_FILES) >= IOS_SHARE_MAX_ENTRIES:
+        oldest = min(_IOS_SHARE_FILES, key=lambda token: _IOS_SHARE_FILES[token][0])
+        _IOS_SHARE_FILES.pop(oldest, None)
+
+
+@app.post("/api/ios-share")
+async def create_ios_share(request: Request):
+    """Publish one bounded ZIP download when insecure iOS lacks Web Share."""
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/zip":
+        raise HTTPException(415, "iOS share fallback requires application/zip")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            raise HTTPException(400, "iOS share fallback has a malformed Content-Length")
+        if declared > IOS_SHARE_MAX_BYTES:
+            raise HTTPException(413, "iOS share fallback exceeds 25 MB")
+
+    # Acquire only after the cheap header rejects, and around the buffering
+    # read only — bogus requests never occupy an in-flight slot.
+    if _IOS_SHARE_SEM.locked():
+        # All slots busy: shed load rather than queue (and hold a connection).
+        raise HTTPException(503, "iOS share fallback busy — retry shortly")
+    async with _IOS_SHARE_SEM:
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > IOS_SHARE_MAX_BYTES:
+                raise HTTPException(413, "iOS share fallback exceeds 25 MB")
+            chunks.append(chunk)
+        content = b"".join(chunks)
+    if not content or not zipfile.is_zipfile(io.BytesIO(content)):
+        raise HTTPException(400, "iOS share fallback is not a valid ZIP")
+
+    _purge_ios_share_files()
+    token = secrets.token_urlsafe(24)
+    name = _safe_ios_share_name(request.headers.get("x-wyltek-filename", ""))
+    _IOS_SHARE_FILES[token] = (time.monotonic(), name, content)
+    return {"url": f"/api/ios-share/{token}"}
+
+
+@app.get("/api/ios-share/{token}", response_class=HTMLResponse)
+async def ios_share_handoff(token: str):
+    """Give standalone iOS PWAs a Safari-owned page before downloading."""
+    _purge_ios_share_files()
+    stored = _IOS_SHARE_FILES.get(token)
+    if stored is None:
+        raise HTTPException(404, "iOS share fallback not found")
+
+    _, stored_name, _ = stored
+    escaped_name = html.escape(stored_name)
+    download_url = f"/api/ios-share/{token}/{quote(stored_name, safe='')}"
+    return HTMLResponse(
+        content=f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Download {escaped_name}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; font: 16px system-ui, sans-serif; color: #17202a; background: #f7f8fa; }}
+    main {{ width: min(100% - 32px, 560px); margin: 0 auto; padding: max(48px, env(safe-area-inset-top)) 0 max(32px, env(safe-area-inset-bottom)); }}
+    img {{ width: 64px; height: 64px; object-fit: contain; }}
+    h1 {{ margin: 24px 0 8px; font-size: 28px; line-height: 1.2; letter-spacing: 0; }}
+    p {{ margin: 0 0 28px; color: #52606d; overflow-wrap: anywhere; }}
+    a, button {{ display: flex; width: 100%; min-height: 48px; align-items: center; justify-content: center; border: 0; border-radius: 6px; font: inherit; font-weight: 650; text-decoration: none; cursor: pointer; }}
+    .download {{ color: white; background: #1769aa; }}
+    .return {{ margin-top: 12px; color: #25313c; background: #e6e9ed; }}
+  </style>
+</head>
+<body>
+  <main>
+    <img src="/static/icons/logo-64.png" alt="HTMLocal">
+    <h1>Download for HTMLocal</h1>
+    <p>{escaped_name}</p>
+    <a class="download" href="{download_url}" download>Download ZIP</a>
+    <button class="return" type="button" onclick="window.close(); setTimeout(() => history.back(), 100)">Return to WyltekGPT</button>
+  </main>
+</body>
+</html>""",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/ios-share/{token}/{name}")
+async def download_ios_share(token: str, name: str):
+    _purge_ios_share_files()
+    stored = _IOS_SHARE_FILES.get(token)
+    if stored is None or name != stored[1]:
+        raise HTTPException(404, "iOS share fallback not found")
+    _, stored_name, content = _IOS_SHARE_FILES.pop(token)
+    encoded_name = quote(stored_name, safe="")
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+        },
+    )
 
 
 # ─── PWA + Web Share Target ────────────────────────────────────────────
