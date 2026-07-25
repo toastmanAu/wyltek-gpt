@@ -1,15 +1,23 @@
 {
   "ckb-expert-0.6b:latest": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:08+00:00",
+    "last_probed": "2026-07-24T15:06:49+00:00",
     "probe_count": 1,
-    "reasoning": false,
-    "tool_calling": "rejected",
+    "reasoning": true,
+    "tool_calling": "native",
     "vision": false
+  },
+  "fara1.5:q4": {
+    "audio": false,
+    "last_probed": "2026-07-24T15:06:47+00:00",
+    "probe_count": 1,
+    "reasoning": true,
+    "tool_calling": "native",
+    "vision": true
   },
   "gemma4:26b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:07+00:00",
+    "last_probed": "2026-07-24T15:06:49+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -17,7 +25,7 @@
   },
   "gemma4:31b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:06+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -25,7 +33,7 @@
   },
   "gemma4:e4b": {
     "audio": true,
-    "last_probed": "2026-04-26T18:02:07+00:00",
+    "last_probed": "2026-07-24T15:06:49+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -33,7 +41,7 @@
   },
   "gpt-oss:20b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:06+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -41,7 +49,7 @@
   },
   "granite4:7b-a1b-h": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:05+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": false,
     "tool_calling": "native",
@@ -49,7 +57,7 @@
   },
   "grm-2.6-plus:q6": {
     "audio": false,
-    "last_probed": "2026-07-16T01:32:37+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -57,87 +65,47 @@
   },
   "haervwe/GLM-4.6V-Flash-9B:latest": {
     "audio": false,
-    "last_probed": "2026-05-21T06:46:51+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
     "vision": true
   },
-  "hf.co/JetBrains/Mellum2-12B-A2.5B-Thinking-GGUF-Q4_K_M:latest": {
+  "hf.co/OBLITERATUS/Qwen3.6-27B-OBLITERATED:Q4_K_M": {
     "audio": false,
-    "last_probed": "2026-07-15T06:27:27+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
-    "vision": false
-  },
-  "hf.co/OBLITERATUS/Qwen3.6-27B-OBLITERATED:Q4_K_M": {
-    "audio": false,
-    "last_probed": "2026-05-23T18:55:27+00:00",
-    "probe_count": 1,
-    "reasoning": false,
-    "tool_calling": "rejected",
     "vision": false
   },
   "hf.co/bartowski/migtissera_Tess-4-27B-GGUF:Q4_K_M": {
     "audio": false,
-    "last_probed": "2026-07-17T12:15:12+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
     "vision": true
-  },
-  "hf.co/deepreinforce-ai/Ornith-1.0-9B-GGUF:Q6_K": {
-    "audio": false,
-    "last_probed": "2026-07-15T06:27:36+00:00",
-    "probe_count": 1,
-    "reasoning": true,
-    "tool_calling": "native",
-    "vision": false
-  },
-  "hf.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF:Q6_K": {
-    "audio": false,
-    "last_probed": "2026-07-15T06:27:42+00:00",
-    "probe_count": 1,
-    "reasoning": true,
-    "tool_calling": "native",
-    "vision": true
-  },
-  "hf.co/unsloth/LFM2.5-8B-A1B-GGUF:UD-Q5_K_M": {
-    "audio": false,
-    "last_probed": "2026-06-29T03:37:27+00:00",
-    "probe_count": 1,
-    "reasoning": true,
-    "tool_calling": "native",
-    "vision": false
   },
   "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_S": {
     "audio": false,
-    "last_probed": "2026-07-17T08:54:12+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
     "vision": true
   },
-  "llama3.1:8b": {
-    "audio": false,
-    "last_probed": "2026-04-26T18:02:05+00:00",
-    "probe_count": 1,
-    "reasoning": false,
-    "tool_calling": "native",
-    "vision": false
-  },
   "moondream:latest": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:08+00:00",
+    "last_probed": "2026-07-24T15:06:49+00:00",
     "probe_count": 1,
     "reasoning": false,
     "tool_calling": "rejected",
     "vision": true
   },
-  "nemotron-3-nano:30b": {
+  "ornith-1.0-35b:q4": {
     "audio": false,
-    "last_probed": "2026-07-15T06:27:22+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -145,7 +113,7 @@
   },
   "qwen3-coder:30b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:06+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": false,
     "tool_calling": "native",
@@ -153,7 +121,7 @@
   },
   "qwen3-vl:30b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:06+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -161,7 +129,7 @@
   },
   "qwen3-vl:32b-thinking": {
     "audio": false,
-    "last_probed": "2026-06-29T03:37:36+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -169,7 +137,7 @@
   },
   "qwen3.5:4b": {
     "audio": false,
-    "last_probed": "2026-06-29T03:37:23+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -177,7 +145,7 @@
   },
   "qwen3.5:9b": {
     "audio": false,
-    "last_probed": "2026-04-26T18:02:07+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -185,7 +153,7 @@
   },
   "qwen3.6:27b": {
     "audio": false,
-    "last_probed": "2026-05-21T07:04:48+00:00",
+    "last_probed": "2026-07-24T15:06:48+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
@@ -193,7 +161,7 @@
   },
   "thinkingcap:q6": {
     "audio": false,
-    "last_probed": "2026-07-15T11:04:05+00:00",
+    "last_probed": "2026-07-24T15:06:47+00:00",
     "probe_count": 1,
     "reasoning": true,
     "tool_calling": "native",
