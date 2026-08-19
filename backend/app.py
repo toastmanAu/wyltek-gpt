@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
+import io
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import sqlite3
 import subprocess
+import time
+import zipfile
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import httpx
 import yaml
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.bridges import cellc as cellc_bridge
@@ -32,6 +39,7 @@ from backend.operations import (
     validate_params,
 )
 from backend.output_copy import copy_to_output
+from backend.sessions import SessionStore, SessionStoreError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("local-chatbot")
@@ -62,6 +70,16 @@ _OUT_RAW = STORAGE.get("output_dir")
 OUTPUT_DIR: Path | None = (
     Path(os.path.expanduser(_OUT_RAW)).resolve() if _OUT_RAW else None
 )
+
+IOS_SHARE_MAX_BYTES = 25 * 1024 * 1024
+IOS_SHARE_TTL_SECONDS = 5 * 60
+IOS_SHARE_MAX_ENTRIES = 8
+# Bound concurrent in-flight uploads: each buffers up to IOS_SHARE_MAX_BYTES
+# before the size cap / eviction apply, so without this a burst of slow-drip
+# POSTs could hold N×25 MB simultaneously and exhaust the single worker.
+IOS_SHARE_MAX_INFLIGHT = 3
+_IOS_SHARE_SEM = asyncio.Semaphore(IOS_SHARE_MAX_INFLIGHT)
+_IOS_SHARE_FILES: dict[str, tuple[float, str, bytes]] = {}
 if OUTPUT_DIR is not None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,6 +96,16 @@ try:
              DEMOS_DIR, "available" if html_demo.available() else "unavailable")
 except Exception as exc:  # never block boot on the demo feature
     log.warning("html_demo init failed: %s", exc)
+
+# ─── Sessions store (server-side history) ────────────────────────────
+_BG_TASKS: set = set()  # holds fire-and-forget asyncio.Task refs (e.g. auto-title) alive
+SESSIONS: SessionStore | None = None
+try:
+    SESSIONS = SessionStore(ROOT / "data" / "sessions.db")
+    log.info("sessions store: %s", ROOT / "data" / "sessions.db")
+except Exception as exc:  # never block boot on the feature
+    log.warning("sessions store init failed: %s", exc)
+    SESSIONS = None
 
 # ─── Converter registry (existing) ───────────────────────────────────
 REGISTRY = Registry(CONFIG.get("converters", []))
@@ -204,6 +232,44 @@ def _full_system_prompt() -> str:
 
 
 # ─── Existing endpoints (config / themes / models / chat / converters) ──
+
+
+async def _titling_call(model: str, first_user: str, first_assistant: str) -> str:
+    """Small non-streaming Ollama call that proposes a short title. Best-effort:
+    any failure (timeout, model missing, bad response) returns "" so the caller
+    falls back to the truncated-first-message title."""
+    prompt = ("Give a 3-6 word title (no quotes, no punctuation at the end) for this chat:\n\n"
+              f"User: {first_user[:500]}\nAssistant: {first_assistant[:500]}\nTitle:")
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": model, "prompt": prompt, "stream": False,
+                                   "options": {"num_predict": 24, "temperature": 0.3}})
+            r.raise_for_status()
+            return (r.json().get("response") or "").strip().strip('"')[:60]
+    except Exception:
+        return ""
+
+
+async def _auto_title(sess_id: str, first_user: str, first_assistant: str) -> None:
+    """Give a still-untitled session a short title. Uses auto_router.summary_model
+    (fallback captioner_model, else a truncated first message). Never raises."""
+    if SESSIONS is None:
+        return
+    try:
+        full = SESSIONS.get_full(sess_id)
+        if full is None or full.get("title"):
+            return   # already titled or gone
+        auto = CONFIG.get("auto_router") or {}
+        model = auto.get("summary_model") or auto.get("captioner_model") or ""
+        title = ""
+        if model:
+            title = await _titling_call(model, first_user, first_assistant)
+        if not title:
+            title = (first_user or "New chat").strip().splitlines()[0][:60]
+        SESSIONS.rename(sess_id, title[:60])
+    except Exception as exc:   # titling must never break chat
+        log.warning("auto-title failed for %s: %s", sess_id, exc)
 
 
 @app.get("/api/config")
@@ -431,6 +497,18 @@ async def chat(payload: dict):
     user_and_assistant = [m for m in incoming if m.get("role") != "system"]
     messages = [{"role": "system", "content": _full_system_prompt()}, *user_and_assistant]
 
+    sess_id = payload.get("chat_session_id")   # sessions store key; NOT the workspace session_id
+    if SESSIONS is not None and sess_id:
+        last_user = next((m.get("content", "") for m in reversed(incoming)
+                          if m.get("role") == "user"), "")
+        try:
+            SESSIONS.append_message(sess_id, "user", last_user)
+            history = SESSIONS.load_context(sess_id)     # [summary?] + prior turns incl. this user msg
+            messages = [{"role": "system", "content": _full_system_prompt()}, *history]
+        except (SessionStoreError, sqlite3.Error) as exc:
+            log.warning("session %s: context load failed, falling back to legacy assembly: %s", sess_id, exc)
+            sess_id = None   # unknown session or store failure -> fall back to legacy assembly below
+
     cellc_chat = False
     if cellc_bridge.available():
         last_user = next((m.get("content", "") for m in reversed(incoming) if m.get("role") == "user"), "")
@@ -502,6 +580,8 @@ async def chat(payload: dict):
         # because `relay` recurses with the same nonlocal state.
         attempted_fallback = False
         in_thinking = False
+        assistant_parts: list[str] = []
+        final_eval = {"tokens": None}
 
         async def relay(source, messages, iterations):
             nonlocal attempted_fallback, in_thinking
@@ -515,6 +595,7 @@ async def chat(payload: dict):
                     if in_thinking:
                         in_thinking = False
                         yield THINK_CLOSE
+                    assistant_parts.append(value)
                     yield value
                 elif kind == "tool_calls":
                     cellc_calls, demo_calls, op_calls = _partition_tool_calls(value)
@@ -582,6 +663,7 @@ async def chat(payload: dict):
                     if in_thinking:
                         in_thinking = False
                         yield THINK_CLOSE
+                    final_eval["tokens"] = value.get("eval_count")
                     yield "\n" + json.dumps({"__stats__": value})
                 elif kind == "error":
                     err_msg = str(value.get("error", "")).lower()
@@ -606,6 +688,21 @@ async def chat(payload: dict):
 
         async for wire in relay(_stream_one(body_with_tools), messages, 0):
             yield wire
+
+        if SESSIONS is not None and sess_id and assistant_parts:
+            try:
+                SESSIONS.append_message(sess_id, "assistant", "".join(assistant_parts),
+                                        tokens=final_eval["tokens"], model=model)
+                full = SESSIONS.get_full(sess_id)
+                if full and not full.get("title") and len(full["messages"]) <= 2:
+                    _first_user = next((m.get("content", "") for m in incoming
+                                        if m.get("role") == "user"), "")
+                    _t = asyncio.create_task(
+                        _auto_title(sess_id, _first_user, "".join(assistant_parts)))
+                    _BG_TASKS.add(_t)
+                    _t.add_done_callback(_BG_TASKS.discard)
+            except (SessionStoreError, sqlite3.Error) as exc:
+                log.warning("session %s: assistant persist failed: %s", sess_id, exc)
 
     return StreamingResponse(stream(), media_type="text/plain")
 
@@ -676,6 +773,49 @@ async def probe_all_known():
         CAPABILITIES._cache = {}
         CAPABILITIES._save()
     return await CAPABILITIES.probe_models(names)
+
+
+# ─── Sessions API ────────────────────────────────────────────────────
+
+@app.post("/api/sessions")
+async def create_session(payload: dict):
+    if SESSIONS is None:
+        raise HTTPException(503, "sessions store unavailable")
+    model = payload.get("model") or ""
+    sid = SESSIONS.create_session(model=model, title=payload.get("title"))
+    return {"id": sid}
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    if SESSIONS is None:
+        return []
+    return SESSIONS.list_sessions()
+
+
+@app.get("/api/sessions/{sid}")
+async def get_session(sid: str):
+    if SESSIONS is None:
+        raise HTTPException(503, "sessions store unavailable")
+    full = SESSIONS.get_full(sid)
+    if full is None:
+        raise HTTPException(404, "session not found")
+    return full
+
+
+@app.patch("/api/sessions/{sid}")
+async def rename_session(sid: str, payload: dict):
+    if SESSIONS is None or SESSIONS.get_full(sid) is None:
+        raise HTTPException(404, "session not found")
+    SESSIONS.rename(sid, payload.get("title") or "")
+    return {"ok": True}
+
+
+@app.delete("/api/sessions/{sid}")
+async def delete_session(sid: str):
+    if SESSIONS is not None:
+        SESSIONS.delete(sid)
+    return {"ok": True}
 
 
 @app.post("/api/operations/enhance")
@@ -1321,6 +1461,124 @@ async def download(session_id: str, name: str):
     if not target.exists():
         raise HTTPException(404, "not found")
     return FileResponse(target, filename=target.name)
+
+
+def _safe_ios_share_name(raw_name: str) -> str:
+    decoded = unquote(raw_name or "")
+    base = re.split(r"[\\/]", decoded)[-1]
+    base = "".join(character for character in base if ord(character) >= 32).strip()
+    base = base[:120]
+    return base if base.lower().endswith(".zip") and base not in {".zip", "..zip"} else "page.zip"
+
+
+def _purge_ios_share_files() -> None:
+    cutoff = time.monotonic() - IOS_SHARE_TTL_SECONDS
+    for token, (created_at, _, _) in list(_IOS_SHARE_FILES.items()):
+        if created_at < cutoff:
+            _IOS_SHARE_FILES.pop(token, None)
+    while len(_IOS_SHARE_FILES) >= IOS_SHARE_MAX_ENTRIES:
+        oldest = min(_IOS_SHARE_FILES, key=lambda token: _IOS_SHARE_FILES[token][0])
+        _IOS_SHARE_FILES.pop(oldest, None)
+
+
+@app.post("/api/ios-share")
+async def create_ios_share(request: Request):
+    """Publish one bounded ZIP download when insecure iOS lacks Web Share."""
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/zip":
+        raise HTTPException(415, "iOS share fallback requires application/zip")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            raise HTTPException(400, "iOS share fallback has a malformed Content-Length")
+        if declared > IOS_SHARE_MAX_BYTES:
+            raise HTTPException(413, "iOS share fallback exceeds 25 MB")
+
+    # Acquire only after the cheap header rejects, and around the buffering
+    # read only — bogus requests never occupy an in-flight slot.
+    if _IOS_SHARE_SEM.locked():
+        # All slots busy: shed load rather than queue (and hold a connection).
+        raise HTTPException(503, "iOS share fallback busy — retry shortly")
+    async with _IOS_SHARE_SEM:
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > IOS_SHARE_MAX_BYTES:
+                raise HTTPException(413, "iOS share fallback exceeds 25 MB")
+            chunks.append(chunk)
+        content = b"".join(chunks)
+    if not content or not zipfile.is_zipfile(io.BytesIO(content)):
+        raise HTTPException(400, "iOS share fallback is not a valid ZIP")
+
+    _purge_ios_share_files()
+    token = secrets.token_urlsafe(24)
+    name = _safe_ios_share_name(request.headers.get("x-wyltek-filename", ""))
+    _IOS_SHARE_FILES[token] = (time.monotonic(), name, content)
+    return {"url": f"/api/ios-share/{token}"}
+
+
+@app.get("/api/ios-share/{token}", response_class=HTMLResponse)
+async def ios_share_handoff(token: str):
+    """Give standalone iOS PWAs a Safari-owned page before downloading."""
+    _purge_ios_share_files()
+    stored = _IOS_SHARE_FILES.get(token)
+    if stored is None:
+        raise HTTPException(404, "iOS share fallback not found")
+
+    _, stored_name, _ = stored
+    escaped_name = html.escape(stored_name)
+    download_url = f"/api/ios-share/{token}/{quote(stored_name, safe='')}"
+    return HTMLResponse(
+        content=f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Download {escaped_name}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; font: 16px system-ui, sans-serif; color: #17202a; background: #f7f8fa; }}
+    main {{ width: min(100% - 32px, 560px); margin: 0 auto; padding: max(48px, env(safe-area-inset-top)) 0 max(32px, env(safe-area-inset-bottom)); }}
+    img {{ width: 64px; height: 64px; object-fit: contain; }}
+    h1 {{ margin: 24px 0 8px; font-size: 28px; line-height: 1.2; letter-spacing: 0; }}
+    p {{ margin: 0 0 28px; color: #52606d; overflow-wrap: anywhere; }}
+    a, button {{ display: flex; width: 100%; min-height: 48px; align-items: center; justify-content: center; border: 0; border-radius: 6px; font: inherit; font-weight: 650; text-decoration: none; cursor: pointer; }}
+    .download {{ color: white; background: #1769aa; }}
+    .return {{ margin-top: 12px; color: #25313c; background: #e6e9ed; }}
+  </style>
+</head>
+<body>
+  <main>
+    <img src="/static/icons/logo-64.png" alt="HTMLocal">
+    <h1>Download for HTMLocal</h1>
+    <p>{escaped_name}</p>
+    <a class="download" href="{download_url}" download>Download ZIP</a>
+    <button class="return" type="button" onclick="window.close(); setTimeout(() => history.back(), 100)">Return to WyltekGPT</button>
+  </main>
+</body>
+</html>""",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/ios-share/{token}/{name}")
+async def download_ios_share(token: str, name: str):
+    _purge_ios_share_files()
+    stored = _IOS_SHARE_FILES.get(token)
+    if stored is None or name != stored[1]:
+        raise HTTPException(404, "iOS share fallback not found")
+    _, stored_name, content = _IOS_SHARE_FILES.pop(token)
+    encoded_name = quote(stored_name, safe="")
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+        },
+    )
 
 
 # ─── PWA + Web Share Target ────────────────────────────────────────────

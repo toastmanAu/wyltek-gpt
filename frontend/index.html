@@ -22,6 +22,7 @@
     <header class="titlebar">
       <img src="/static/icons/logo-64.png" class="titlebar-logo" alt="" width="32" height="32" />
       <span class="titlebar-name">wyltek-gpt</span>
+      <button id="sessions-btn" class="titlebar-btn" type="button" aria-label="Chats" title="Chats">🗂</button>
       <button id="settings-btn" class="titlebar-btn" type="button" aria-label="Settings" title="Settings">⚙</button>
     </header>
     <header class="bar">
@@ -72,6 +73,18 @@
       <button id="send" type="submit">send</button>
     </form>
   </main>
+
+  <div id="sessions-backdrop" class="settings-backdrop hidden"></div>
+  <aside id="sessions-panel" class="settings sessions-panel hidden" aria-hidden="true" aria-label="Chat sessions">
+    <header class="settings-head">
+      <span>chats</span>
+      <button id="sessions-close" type="button" class="ghost" aria-label="Close">×</button>
+    </header>
+    <div class="settings-body">
+      <button id="new-session" type="button" class="settings-btn">+ New chat</button>
+      <ul id="session-list" class="session-list"></ul>
+    </div>
+  </aside>
 
   <div id="settings-backdrop" class="settings-backdrop hidden"></div>
   <aside id="settings" class="settings hidden" aria-hidden="true" aria-label="Settings">
