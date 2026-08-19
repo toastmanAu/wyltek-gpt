@@ -33,3 +33,8 @@ demos/
 data/sessions.db
 data/sessions.db-wal
 data/sessions.db-shm
+
+# Tool / build output
+graphify-out/
+unsloth_compiled_cache/
+.playwright-mcp/
